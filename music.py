@@ -30,6 +30,8 @@ import logging
 import os
 import random
 import re
+import shutil
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -251,6 +253,65 @@ def _best_thumbnail(thumbnails: list[dict]) -> str:
 # --------------------------------------------------------------------------
 # Core engine
 # --------------------------------------------------------------------------
+
+def _find_js_runtime() -> tuple[str, str, str] | None:
+    """Locate a real JavaScript runtime executable for yt-dlp.
+
+    Vercel's Python runtime does not guarantee that `deno`, `node`, or `qjs`
+    exists on PATH. The deployment build downloads a Linux Deno executable to
+    `vendor/deno`, which is intentionally ignored by Git so GitHub stays
+    lightweight while the Vercel build artifact still contains the runtime.
+    """
+    candidates: list[tuple[str, Path]] = []
+
+    env_candidates = [
+        ("deno", os.environ.get("SUJALCONNECT_DENO_PATH")),
+        ("node", os.environ.get("SUJALCONNECT_NODE_PATH")),
+        ("qjs", os.environ.get("SUJALCONNECT_QJS_PATH")),
+    ]
+    for name, configured in env_candidates:
+        if configured:
+            p = Path(configured).expanduser()
+            candidates.append((name, p))
+
+    bundled_deno = Path(__file__).resolve().parent / "vendor" / "deno"
+    candidates.append(("deno", bundled_deno))
+
+    for name in ("deno", "node", "qjs", "quickjs"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(("quickjs" if name == "quickjs" else name, Path(found)))
+
+    seen: set[tuple[str, str]] = set()
+    for runtime_name, runtime_path in candidates:
+        key = (runtime_name, str(runtime_path))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if not runtime_path.exists() or not runtime_path.is_file():
+                continue
+            if not os.access(runtime_path, os.X_OK):
+                try:
+                    runtime_path.chmod(runtime_path.stat().st_mode | 0o111)
+                except Exception:
+                    continue
+            probe = subprocess.run(
+                [str(runtime_path), "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if probe.returncode == 0:
+                return runtime_name, str(runtime_path), probe.stdout.strip()
+        except Exception:
+            continue
+
+    return None
+
+
 class MusicEngine:
     """
     Thread-safe wrapper around yt-dlp providing search, stream resolution,
@@ -359,57 +420,10 @@ class MusicEngine:
         opts["http_headers"] = dict(self._BASE_OPTS["http_headers"])
 
         # yt-dlp's current YouTube extractor needs a supported JS runtime.
-        # For GitHub -> Vercel deployments we install the official Deno binary
-        # through the `deno` PyPI package rather than committing a large binary
-        # into the repository. This keeps the repository GitHub-safe while
-        # ensuring the Vercel Python function has a runtime available.
+        # The Vercel build downloads a Linux Deno binary into vendor/deno, so
+        # the function does not depend on a system-wide runtime being present.
         try:
-            import shutil
-            import subprocess
-            candidates: list[tuple[str, Path]] = []
-
-            configured = os.environ.get("SUJALCONNECT_DENO_PATH") or os.environ.get("SUJALCONNECT_NODE_PATH")
-            if configured:
-                candidates.append(("deno" if "DENO" in os.environ else "node", Path(configured)))
-
-            if _deno_pkg is not None:
-                try:
-                    deno_bin = Path(_deno_pkg.find_deno_bin())
-                    candidates.insert(0, ("deno", deno_bin))
-                except Exception as exc:
-                    log.warning("Could not locate Deno from Python package: %s", exc)
-
-            for name in ("deno", "node", "qjs"):
-                path = shutil.which(name)
-                if path:
-                    candidates.append((name, Path(path)))
-
-            # De-duplicate candidates while preserving priority.
-            seen = set()
-            deduped = []
-            for item in candidates:
-                key = (item[0], str(item[1]))
-                if key not in seen:
-                    seen.add(key)
-                    deduped.append(item)
-
-            selected = None
-            for runtime_name, runtime_path in deduped:
-                try:
-                    probe = subprocess.run(
-                        [str(runtime_path), "--version"],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        timeout=3,
-                        check=False,
-                    )
-                    if probe.returncode == 0:
-                        selected = (runtime_name, str(runtime_path), probe.stdout.strip())
-                        break
-                except Exception:
-                    continue
-
+            selected = _find_js_runtime()
             if selected:
                 runtime_name, runtime_path, runtime_version = selected
                 opts["js_runtimes"] = [f"{runtime_name}:{runtime_path}"]
@@ -417,11 +431,9 @@ class MusicEngine:
             else:
                 log.error(
                     "No supported JavaScript runtime found for yt-dlp. "
-                    "Install the deno dependency or set SUJALCONNECT_DENO_PATH."
+                    "Expected bundled vendor/deno or SUJALCONNECT_DENO_PATH."
                 )
 
-            # EJS scripts are provided by yt-dlp[default]. GitHub EJS downloads
-            # remain opt-in only; they are not required for normal deployments.
             if os.environ.get("SUJALCONNECT_ALLOW_REMOTE_EJS") == "1":
                 opts["remote_components"] = ["ejs:github"]
         except Exception as exc:
@@ -593,22 +605,22 @@ class MusicEngine:
 
     # --------------------------------------------------------- diagnostics
     def runtime_info(self) -> dict:
-        import shutil
-        runtimes = {name: shutil.which(name) for name in ("deno", "node", "qjs")}
-        deno_bin = ""
-        deno_ok = False
-        if _deno_pkg is not None:
-            try:
-                deno_bin = str(_deno_pkg.find_deno_bin())
-                deno_ok = bool(deno_bin and os.path.exists(deno_bin))
-            except Exception:
-                pass
+        runtime = _find_js_runtime()
+        bundled_deno = Path(__file__).resolve().parent / "vendor" / "deno"
+        deno_pkg = _deno_pkg is not None
         return {
-            "deno_package_installed": _deno_pkg is not None,
-            "deno_binary": deno_bin,
-            "deno_binary_exists": deno_ok,
-            "path_runtimes": runtimes,
-            "runtime_override": os.environ.get("SUJALCONNECT_DENO_PATH") or os.environ.get("SUJALCONNECT_NODE_PATH"),
+            "deno_package_installed": deno_pkg,
+            "bundled_deno_path": str(bundled_deno),
+            "bundled_deno_exists": bundled_deno.exists(),
+            "bundled_deno_executable": os.access(bundled_deno, os.X_OK) if bundled_deno.exists() else False,
+            "selected_runtime": runtime[0] if runtime else None,
+            "selected_runtime_path": runtime[1] if runtime else None,
+            "selected_runtime_version": runtime[2] if runtime else None,
+            "runtime_override": (
+                os.environ.get("SUJALCONNECT_DENO_PATH")
+                or os.environ.get("SUJALCONNECT_NODE_PATH")
+                or os.environ.get("SUJALCONNECT_QJS_PATH")
+            ),
             "remote_ejs": os.environ.get("SUJALCONNECT_ALLOW_REMOTE_EJS") == "1",
         }
 

@@ -33,3 +33,8 @@ SujalConnect first attempts direct audio extraction. If the server cannot resolv
 - `/api/health`
 - `/api/runtime`
 - `/api/stream-debug/<VIDEO_ID>`
+
+
+## V6 GitHub → Vercel runtime fix
+
+Push the repository contents to GitHub; do **not** commit `vendor/deno`. Vercel runs `build_vercel.sh` automatically and downloads the pinned Linux Deno runtime into the function build. After deployment, verify `/api/runtime` reports `bundled_deno_exists: true`, `bundled_deno_executable: true`, and `selected_runtime: deno`.
