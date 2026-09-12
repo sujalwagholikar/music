@@ -1,18 +1,35 @@
-# SujalConnect — Vercel deployment
+# SujalConnect — Vercel deployment notes
 
-## What changed
-- Added `app.py` as the Vercel FastAPI entrypoint.
-- Added `pyproject.toml` with Python 3.12+ dependencies.
-- Added `vercel.json` security headers.
-- Moved runtime-writable cache/user data to `/tmp/sujalconnect` on Vercel.
-- Kept local development behavior unchanged.
+## What this package fixes
+
+- Vercel-safe runtime/cache paths under `/tmp`
+- No runtime writes beside the deployed source
+- Modern zero-config FastAPI entrypoint (`app.py`)
+- `yt-dlp[default]` with current YouTube EJS support
+- Fresh stream URL resolution with per-video locking
+- Forwarding of safe `yt-dlp` media headers
+- Correct 200/206/416/4xx handling in the audio proxy
+- Automatic retry/re-resolution after stale upstream media URLs
+- Bounded byte-range proxy responses to reduce long-lived serverless requests
+- Frontend playback retry before skipping a track
+- Configurable CORS only when `CORS_ORIGINS` is set
+- Vercel function max duration set to 300 seconds
+- Runtime diagnostics at `/api/runtime`
 
 ## Deploy
-1. Install Vercel CLI: `npm i -g vercel`
-2. From this directory run: `vercel`
-3. For production: `vercel --prod`
 
-## Important production note
-The app currently stores users, likes, history, and metadata caches in process-local memory plus `/tmp`. Vercel function instances are ephemeral and can scale horizontally, so this is suitable for a demo/prototype but **not durable multi-user production storage**. Replace `UserStore` and the metadata/album cache with a managed database/cache before treating the app as production-grade.
+1. Upload this folder to a Git repository and import it into Vercel, or run `vercel` from the project root.
+2. Use the default Python runtime detected from `app.py` and `pyproject.toml`.
+3. Deploy.
 
-The audio proxy and yt-dlp work are also compute/network intensive. Test your Vercel plan's function duration and traffic limits before relying on it for high-volume playback.
+## Smoke test after deployment
+
+- `/api/health`
+- `/api/runtime`
+- `/api/search?q=Chinnamma`
+- Search a song and press play.
+- Verify the browser Network tab shows `/api/proxy-audio/...` returning `206 Partial Content` for range requests.
+
+## Important persistence note
+
+Guest accounts, likes, history and JSON caches are intentionally stored under `/tmp` on Vercel. This avoids deployment crashes, but `/tmp` is ephemeral. A production multi-user app should move `UserStore` and shared cache data to a managed database/Redis later.

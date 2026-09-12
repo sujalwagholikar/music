@@ -76,7 +76,7 @@ ALBUM_CACHE_FILE = CACHE_DIR / "album_cache.json"
 # Stream URLs from YouTube expire (~6 hours typically). We cache metadata
 # (poster, title, artist, duration, video id) essentially forever, but we
 # always re-resolve the actual playable stream URL if it's older than this:
-STREAM_URL_TTL_SECONDS = 60 * 60 * 3  # 3 hours, safely inside YouTube's window
+STREAM_URL_TTL_SECONDS = 60 * 20  # 3 hours, safely inside YouTube's window
 METADATA_TTL_SECONDS = 60 * 60 * 24 * 14  # 2 weeks
 ALBUM_TTL_SECONDS = 60 * 60 * 24 * 7  # 1 week -- album tracklists rarely change
 
@@ -96,6 +96,7 @@ class Song:
     poster: str  # high-res thumbnail / "album art"
     stream_url: Optional[str] = None
     stream_fetched_at: float = 0.0
+    stream_headers: dict[str, str] = field(default_factory=dict, repr=False)
     audio_format: str = "m4a"
     bitrate: Optional[float] = None
     source: str = "youtube"
@@ -259,30 +260,24 @@ class MusicEngine:
         "skip_download": True,
         "extract_flat": False,
         "geo_bypass": True,
-        "nocheckcertificate": True,
-        "socket_timeout": 15,
-        "source_address": "0.0.0.0",
-        # Prefer m4a (AAC) since it's broadly seekable/streamable in <audio>
-        # tags across browsers without extra transcoding, while still HQ.
+        "socket_timeout": 20,
+        "retries": 2,
+        "extractor_retries": 2,
+        "fragment_retries": 2,
+        "file_access_retries": 2,
         "format": (
             "bestaudio[ext=m4a][abr<=256]/"
             "bestaudio[ext=m4a]/"
             "bestaudio[acodec^=mp4a]/"
             "bestaudio/best"
         ),
-        "extractor_args": {
-            "youtube": {
-                # 'android'/'ios' clients are far less likely to be throttled
-                # or blocked than 'web', and usually return direct googlevideo
-                # URLs that work great in an HTML5 <audio> element.
-                "player_client": ["android", "web"],
-            }
-        },
         "http_headers": {
             "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            )
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/128.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
         },
     }
 
@@ -292,6 +287,7 @@ class MusicEngine:
         self._search_cache: dict[str, tuple[float, list[str]]] = {}  # query -> (ts, [song_ids])
         self._album_cache: dict[str, Album] = {}  # album_id -> Album
         self._song_to_album: dict[str, str] = {}  # song_id -> album_id (fast reverse lookup)
+        self._resolve_locks: dict[str, threading.Lock] = {}
         self._load_persistent_cache()
         self._load_album_cache()
         log.info(
@@ -305,7 +301,9 @@ class MusicEngine:
             try:
                 raw = json.loads(METADATA_CACHE_FILE.read_text(encoding="utf-8"))
                 for sid, data in raw.items():
+                    data = dict(data)
                     data.pop("stream_url", None)  # never trust old stream urls
+                    data["stream_headers"] = {}
                     data["stream_fetched_at"] = 0.0
                     self._song_cache[sid] = Song(**data)
             except Exception as e:
@@ -315,7 +313,7 @@ class MusicEngine:
         try:
             with self._lock:
                 serializable = {
-                    sid: {**asdict(s), "stream_url": None}
+                    sid: {**asdict(s), "stream_url": None, "stream_headers": {}}
                     for sid, s in self._song_cache.items()
                 }
             METADATA_CACHE_FILE.write_text(
@@ -352,8 +350,33 @@ class MusicEngine:
     # ----------------------------------------------------------- internals
     def _ydl(self, extra_opts: Optional[dict] = None) -> YoutubeDL:
         opts = dict(self._BASE_OPTS)
+        opts["http_headers"] = dict(self._BASE_OPTS["http_headers"])
+
+        # yt-dlp's current YouTube extractor uses external JS challenge
+        # solving when a supported JS runtime is available. On Vercel we do
+        # not assume one exists, so detect it instead of hard-coding a path.
+        try:
+            import shutil
+            runtimes = []
+            for name in ("deno", "node", "qjs"):
+                path = shutil.which(name)
+                if path:
+                    runtimes.append(f"{name}:{path}")
+            if runtimes:
+                opts["js_runtimes"] = runtimes
+            # Allow the bundled/installed EJS package to satisfy the runtime
+            # without failing hard if a remote source is unavailable.
+            opts["remote_components"] = ["ejs:github"]
+        except Exception:
+            pass
+
         if extra_opts:
-            opts.update(extra_opts)
+            # Preserve nested dicts where appropriate
+            for key, value in extra_opts.items():
+                if key == "http_headers" and isinstance(value, dict):
+                    opts["http_headers"].update(value)
+                else:
+                    opts[key] = value
         return YoutubeDL(opts)
 
     def _song_from_info(self, info: dict) -> Song:
@@ -369,6 +392,18 @@ class MusicEngine:
         stream_url = info.get("url")
         abr = info.get("abr")
         ext = info.get("ext", "m4a")
+
+        # Keep only headers that are useful when replaying a resolved media
+        # URL. Do not persist cookies or authorization tokens. In particular,
+        # YouTube media URLs may require the Referer/User-Agent that yt-dlp
+        # used when extracting them; dropping those headers can produce a
+        # 403 on the Vercel side even though local playback works.
+        raw_headers = info.get("http_headers") or {}
+        allowed_headers = {"User-Agent", "Referer", "Origin", "Accept", "Accept-Language"}
+        stream_headers = {
+            str(k): str(v) for k, v in raw_headers.items()
+            if str(k).title() in {h.title() for h in allowed_headers}
+        }
 
         # yt-dlp surfaces YouTube Music release metadata on many extractions:
         # `album` (name), `track` (clean track title), `artists`/`artist`,
@@ -395,6 +430,7 @@ class MusicEngine:
             poster=poster,
             stream_url=stream_url,
             stream_fetched_at=time.time() if stream_url else 0.0,
+            stream_headers=stream_headers,
             audio_format=ext,
             bitrate=abr,
             view_count=info.get("view_count"),
@@ -410,6 +446,7 @@ class MusicEngine:
             if existing and not song.stream_url:
                 song.stream_url = existing.stream_url
                 song.stream_fetched_at = existing.stream_fetched_at
+                song.stream_headers = dict(existing.stream_headers)
             # Never let a partial/flat re-fetch erase album info we already
             # resolved for this song (e.g. via full extraction or the album
             # resolver itself, which is a stronger signal than search flat entries).
@@ -498,44 +535,79 @@ class MusicEngine:
         threading.Thread(target=self._persist_cache, daemon=True).start()
 
     # --------------------------------------------------------- resolution
-    def get_stream_url(self, video_id: str) -> Optional[Song]:
+    def get_stream_url(self, video_id: str, force_refresh: bool = False) -> Optional[Song]:
+        """Resolve a fresh direct audio source for ``video_id``.
+
+        A media URL is intentionally treated as a short-lived lease rather
+        than durable metadata. ``force_refresh=True`` is used by the audio
+        proxy after an upstream 403/404/410/5xx so an expired Googlevideo URL
+        is not reused. Per-video locks prevent a burst of concurrent playback
+        requests from launching duplicate yt-dlp resolutions.
         """
-        Resolve (or re-resolve if stale) the direct playable stream URL for
-        a given video id, returning the fully-populated Song. This is the
-        function server.py calls right before playback so the URL is fresh.
-        """
+        video_id = (video_id or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+            return None
+
         with self._lock:
             cached = self._song_cache.get(video_id)
+            resolve_lock = self._resolve_locks.setdefault(video_id, threading.Lock())
 
+        # Short media-URL cache. Metadata itself remains much longer lived.
         needs_fetch = (
-            cached is None
+            force_refresh
+            or cached is None
             or not cached.stream_url
             or (time.time() - cached.stream_fetched_at) > STREAM_URL_TTL_SECONDS
         )
-
         if not needs_fetch:
             return cached
 
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        log.info("Resolving stream for video_id=%s", video_id)
-        try:
-            with self._ydl() as ydl:
-                info = ydl.extract_info(url, download=False)
-        except Exception as e:
-            log.error("Failed to resolve stream for %s: %s", video_id, e)
-            return cached  # return whatever we had (maybe just metadata, no stream)
+        with resolve_lock:
+            # Another request may have refreshed the URL while we waited.
+            with self._lock:
+                cached = self._song_cache.get(video_id)
+            if (
+                cached
+                and not force_refresh
+                and cached.stream_url
+                and (time.time() - cached.stream_fetched_at) <= STREAM_URL_TTL_SECONDS
+            ):
+                return cached
 
-        fresh = self._song_from_info(info)
-        # Preserve any nicer cleaned title/artist we might already have cached
-        if cached:
-            fresh.genre_hint = cached.genre_hint
-            if cached.album_id and not fresh.album_id:
-                fresh.album_id = cached.album_id
-                fresh.album_name = cached.album_name
-                fresh.track_number = fresh.track_number or cached.track_number
-        self._cache_song(fresh)
-        self._persist_cache_async()
-        return fresh
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            log.info("Resolving stream for video_id=%s (force=%s)", video_id, force_refresh)
+            try:
+                with self._ydl() as ydl:
+                    info = ydl.extract_info(url, download=False)
+            except Exception as e:
+                log.error("Failed to resolve stream for %s: %s", video_id, e)
+                return cached
+
+            fresh = self._song_from_info(info)
+            if not fresh or fresh.id != video_id or not fresh.stream_url:
+                log.warning("yt-dlp returned no direct stream for %s", video_id)
+                return cached
+
+            # Preserve any nicer metadata already discovered by search/album
+            # resolution. The new media URL + headers always win.
+            if cached:
+                fresh.genre_hint = cached.genre_hint
+                if cached.album_id and not fresh.album_id:
+                    fresh.album_id = cached.album_id
+                    fresh.album_name = cached.album_name
+                    fresh.track_number = fresh.track_number or cached.track_number
+
+            self._cache_song(fresh)
+            self._persist_cache_async()
+            return fresh
+
+    def invalidate_stream(self, video_id: str) -> None:
+        with self._lock:
+            cached = self._song_cache.get(video_id)
+            if cached:
+                cached.stream_url = None
+                cached.stream_headers = {}
+                cached.stream_fetched_at = 0.0
 
     def get_song_metadata(self, video_id: str) -> Optional[Song]:
         with self._lock:

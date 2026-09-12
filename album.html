@@ -855,8 +855,18 @@ async function loadAndPlayCurrent(){
     state.isPlaying = true;
   }catch(e){
     console.error('Playback failed', e);
-    showToast('Could not play this song');
-    state.isPlaying = false;
+    // Force a fresh backend media resolution before declaring the track dead.
+    try{
+      await api(`/api/stream/${encodeURIComponent(song.id)}?refresh=1`);
+      audioEl.src = API + `/api/proxy-audio/${encodeURIComponent(song.id)}`;
+      audioEl.load();
+      await audioEl.play();
+      state.isPlaying = true;
+    }catch(retryErr){
+      console.error('Playback retry failed', retryErr);
+      showToast('Could not play this song');
+      state.isPlaying = false;
+    }
   }
   setBuffering(false);
   updateAllPlayIcons();

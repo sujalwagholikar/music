@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -72,6 +73,8 @@ DATA_DIR = RUNTIME_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 USERS_DB_FILE = DATA_DIR / "users.json"
 SESSION_COOKIE_NAME = "sujal_session"
+AUDIO_PROXY_CHUNK_BYTES = 2 * 1024 * 1024  # keep each serverless response small
+VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 AVAILABLE_GENRES = list(music.MusicEngine.GENRE_SEED_QUERIES.keys())
 
@@ -180,13 +183,16 @@ app = FastAPI(
     version="1.0.0",
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+cors_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
+if cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization", "Range"],
+        expose_headers=["Accept-Ranges", "Content-Length", "Content-Range", "Content-Type"],
+    )
 
 
 # --------------------------------------------------------------------------
@@ -239,7 +245,7 @@ def _serve_html_file(path: Path, label: str) -> HTMLResponse:
 
 
 @app.get("/", response_class=HTMLResponse)
-async def serve_index():
+def serve_index():
     return _serve_html_file(INDEX_FILE, "index.html")
 
 
@@ -251,31 +257,83 @@ async def serve_index():
 # here (same pattern as "/") fixes it, and query params (?id=...&title=...)
 # are untouched since they're read client-side via URLSearchParams anyway.
 @app.get("/album.html", response_class=HTMLResponse)
-async def serve_album_page():
+def serve_album_page():
     return _serve_html_file(ALBUM_FILE, "album.html")
 
 
 @app.get("/playlist.html", response_class=HTMLResponse)
-async def serve_playlist_page():
+def serve_playlist_page():
     return _serve_html_file(PLAYLIST_FILE, "playlist.html")
 
 
+@app.get("/api/runtime")
+def runtime_info():
+    return {
+        "vercel": bool(os.environ.get("VERCEL")),
+        "python": os.sys.version.split()[0],
+        "runtime_dir": str(music.RUNTIME_DIR),
+        "cache_dir": str(music.CACHE_DIR),
+        "cwd_writable": os.access(str(BASE_DIR), os.W_OK),
+        "stream_chunk_bytes": AUDIO_PROXY_CHUNK_BYTES,
+        "max_duration_hint_seconds": 300,
+    }
+
+
 @app.get("/api/health")
-async def health():
+def health():
     return {"status": "ok", "engine_stats": music.engine.stats(), "time": time.time()}
 
 
 @app.get("/api/genres")
-async def get_genres():
+def get_genres():
     """List of genres the onboarding portal can offer as preference chips."""
     return {"genres": AVAILABLE_GENRES}
 
 
 # --------------------------------------------------------------------------
+# Request validation / audio helpers
+# --------------------------------------------------------------------------
+def _validate_video_id(video_id: str) -> str:
+    video_id = (video_id or "").strip()
+    if not VIDEO_ID_RE.fullmatch(video_id):
+        raise HTTPException(status_code=400, detail="Invalid video id")
+    return video_id
+
+
+def _parse_range_header(value: Optional[str]) -> Optional[tuple[int, Optional[int]]]:
+    if not value:
+        return None
+    m = re.fullmatch(r"bytes=(\d+)-(\d*)", value.strip())
+    if not m:
+        return None
+    start = int(m.group(1))
+    end = int(m.group(2)) if m.group(2) else None
+    if end is not None and end < start:
+        return None
+    return start, end
+
+
+def _safe_upstream_headers(song: music.Song) -> dict[str, str]:
+    headers = dict(song.stream_headers or {})
+    # Requests sends its own Host/Connection/etc. Keep only headers yt-dlp
+    # may have attached specifically for the media request.
+    allowed = {"user-agent", "referer", "origin", "accept", "accept-language"}
+    return {k: v for k, v in headers.items() if k.lower() in allowed}
+
+
+def _audio_content_type(headers: dict) -> str:
+    value = headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    if value.startswith("audio/"):
+        return value
+    if value in {"video/mp4", "application/octet-stream"}:
+        return value
+    return ""
+
+# --------------------------------------------------------------------------
 # Search
 # --------------------------------------------------------------------------
 @app.get("/api/search")
-async def search_songs(q: str = Query(..., min_length=1), limit: int = 24):
+def search_songs(q: str = Query(..., min_length=1, max_length=200), limit: int = Query(24, ge=1, le=50)):
     results = music.engine.search(q, limit=limit)
     return {"query": q, "count": len(results), "results": [s.to_public_dict() for s in results]}
 
@@ -284,7 +342,8 @@ async def search_songs(q: str = Query(..., min_length=1), limit: int = 24):
 # Metadata only (fast, no network hit if cached)
 # --------------------------------------------------------------------------
 @app.get("/api/song/{video_id}")
-async def get_song(video_id: str):
+def get_song(video_id: str):
+    video_id = _validate_video_id(video_id)
     song = music.engine.get_song_metadata(video_id)
     if not song:
         # not seen before -- do a full resolve as a fallback
@@ -298,9 +357,10 @@ async def get_song(video_id: str):
 # Stream URL resolution (used by the player right before playback)
 # --------------------------------------------------------------------------
 @app.get("/api/stream/{video_id}")
-async def get_stream(video_id: str, request: Request, response: Response):
+def get_stream(video_id: str, request: Request, response: Response, refresh: bool = False):
+    video_id = _validate_video_id(video_id)
     session_id, _user = get_or_create_session(request, response)
-    song = music.engine.get_stream_url(video_id)
+    song = music.engine.get_stream_url(video_id, force_refresh=refresh)
     if not song or not song.stream_url:
         raise HTTPException(status_code=404, detail="Could not resolve a playable stream for this song")
 
@@ -318,63 +378,201 @@ async def get_stream(video_id: str, request: Request, response: Response):
 # Audio proxy -- streams actual bytes with Range support for seeking
 # --------------------------------------------------------------------------
 @app.get("/api/proxy-audio/{video_id}")
-async def proxy_audio(video_id: str, request: Request):
+def proxy_audio(video_id: str, request: Request):
+    """
+    Vercel-safe byte-range audio proxy.
+
+    Key fixes versus the old implementation:
+      * validates video ids;
+      * forwards the safe headers yt-dlp extracted with the media URL;
+      * retries on upstream 403/404/410/429/5xx by forcing a fresh URL;
+      * never lies about an upstream failure by converting it to HTTP 200;
+      * caps each response to ~2 MiB so long tracks do not require one
+        serverless invocation to stay open for the whole song;
+      * supports standard browser Range requests and returns proper 206/416
+        semantics.
+    """
+    video_id = _validate_video_id(video_id)
+    client_range = request.headers.get("range")
+    parsed_range = _parse_range_header(client_range)
+
+    if client_range and parsed_range is None:
+        return Response(status_code=416, headers={"Content-Range": "bytes */*"})
+
+    range_start = parsed_range[0] if parsed_range else 0
+    requested_end = parsed_range[1] if parsed_range else None
+    range_was_explicit = parsed_range is not None
+
+    def _upstream_request(song: music.Song):
+        headers = _safe_upstream_headers(song)
+        # Always request a bounded byte range. This makes initial playback
+        # chunked too, rather than letting a serverless request try to relay
+        # an entire multi-megabyte track in one invocation.
+        if requested_end is None:
+            upstream_end = range_start + AUDIO_PROXY_CHUNK_BYTES - 1
+        else:
+            upstream_end = min(requested_end, range_start + AUDIO_PROXY_CHUNK_BYTES - 1)
+        headers["Range"] = f"bytes={range_start}-{upstream_end}"
+        return requests.get(
+            song.stream_url,
+            headers=headers,
+            stream=True,
+            allow_redirects=True,
+            timeout=(10, 30),
+        ), upstream_end
+
     song = music.engine.get_stream_url(video_id)
     if not song or not song.stream_url:
         raise HTTPException(status_code=404, detail="Stream unavailable")
 
-    upstream_headers = {}
-    range_header = request.headers.get("range")
-    if range_header:
-        upstream_headers["Range"] = range_header
-
-    try:
-        upstream = requests.get(
-            song.stream_url,
-            headers=upstream_headers,
-            stream=True,
-            timeout=15,
-        )
-    except requests.RequestException as e:
-        log.warning("Upstream fetch failed for %s (%s), re-resolving once...", video_id, e)
-        # URL might have just expired -- force a fresh resolve and retry once
-        with music.engine._lock:  # noqa: SLF001 (internal reuse is fine, same package)
-            cached = music.engine._song_cache.get(video_id)
-            if cached:
-                cached.stream_fetched_at = 0.0
-        song = music.engine.get_stream_url(video_id)
-        if not song or not song.stream_url:
-            raise HTTPException(status_code=502, detail="Upstream audio source unavailable")
+    upstream = None
+    upstream_end = None
+    last_status = None
+    for attempt in range(2):
         try:
-            upstream = requests.get(song.stream_url, headers=upstream_headers, stream=True, timeout=15)
-        except requests.RequestException:
-            raise HTTPException(status_code=502, detail="Upstream audio source unavailable")
+            upstream, upstream_end = _upstream_request(song)
+            last_status = upstream.status_code
+            content_type = _audio_content_type(upstream.headers)
+
+            # These statuses strongly indicate that the short-lived media URL
+            # is stale or temporarily rejected. Resolve a brand-new one once.
+            if upstream.status_code in {401, 403, 404, 410, 429} or upstream.status_code >= 500:
+                upstream.close()
+                upstream = None
+                if attempt == 0:
+                    music.engine.invalidate_stream(video_id)
+                    song = music.engine.get_stream_url(video_id, force_refresh=True)
+                    if not song or not song.stream_url:
+                        break
+                    continue
+                break
+
+            if not content_type and upstream.status_code in {200, 206}:
+                # HTML error pages should never be passed to <audio>.
+                preview = upstream.raw.read(256, decode_content=False) if upstream.raw else b""
+                upstream.close()
+                upstream = None
+                if attempt == 0:
+                    music.engine.invalidate_stream(video_id)
+                    song = music.engine.get_stream_url(video_id, force_refresh=True)
+                    if song and song.stream_url:
+                        continue
+                raise HTTPException(status_code=502, detail="Upstream returned a non-audio response")
+
+            break
+        except requests.RequestException as exc:
+            log.warning("Audio upstream request failed for %s: %s", video_id, exc)
+            if upstream is not None:
+                upstream.close()
+                upstream = None
+            if attempt == 0:
+                music.engine.invalidate_stream(video_id)
+                song = music.engine.get_stream_url(video_id, force_refresh=True)
+                if song and song.stream_url:
+                    continue
+            raise HTTPException(status_code=502, detail="Upstream audio source unavailable") from exc
+
+    if upstream is None:
+        raise HTTPException(status_code=502, detail=f"Upstream audio source unavailable ({last_status or 'no response'})")
+
+    if upstream.status_code not in {200, 206}:
+        status = upstream.status_code
+        upstream.close()
+        if status == 416:
+            return Response(status_code=416, headers={"Content-Range": upstream.headers.get("Content-Range", "bytes */*")})
+        raise HTTPException(status_code=502, detail=f"Upstream audio source rejected the request ({status})")
+
+    response_headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Content-Disposition": f'inline; filename="{video_id}.audio"',
+        "X-Content-Type-Options": "nosniff",
+    }
+
+    content_type = _audio_content_type(upstream.headers) or "audio/mp4"
+    response_headers["Content-Type"] = content_type
+
+    upstream_content_range = upstream.headers.get("Content-Range")
+    upstream_length = upstream.headers.get("Content-Length")
+    upstream_total = None
+    if upstream_content_range:
+        m = re.match(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", upstream_content_range)
+        if m and m.group(3) != "*":
+            upstream_total = int(m.group(3))
+
+    # Most YouTube media responses honor Range and return 206 + Content-Range.
+    # If the upstream ignores the synthetic initial range and sends 200, only
+    # do that for offset 0 and synthesize a correct partial response.
+    if upstream.status_code == 206:
+        status_code = 206
+        if upstream_content_range:
+            response_headers["Content-Range"] = upstream_content_range
+        else:
+            # Some compatible origins return 206 without Content-Range.
+            # Synthesize the range from the request offset and length; `*`
+            # is valid when the complete object size is unknown.
+            length = int(upstream_length or 0)
+            last = range_start + max(0, length - 1)
+            response_headers["Content-Range"] = f"bytes {range_start}-{last}/*"
+        if upstream_length:
+            response_headers["Content-Length"] = str(min(int(upstream_length), AUDIO_PROXY_CHUNK_BYTES))
+    elif upstream.status_code == 200:
+        if range_start != 0:
+            upstream.close()
+            # A non-zero seek without upstream range support is not safe to
+            # fake. Ask the browser to retry with a fresh resolution.
+            raise HTTPException(status_code=502, detail="Audio source does not support seeking")
+        total = upstream_total
+        try:
+            if total is None and upstream_length:
+                total = int(upstream_length)
+        except ValueError:
+            total = None
+        # We deliberately requested a bounded range. If the origin ignored it,
+        # stream only one chunk and tell the browser the full object size when
+        # known. Chrome will request subsequent ranges.
+        if total is not None:
+            last_byte = min(total - 1, AUDIO_PROXY_CHUNK_BYTES - 1)
+            status_code = 206
+            response_headers["Content-Range"] = f"bytes 0-{last_byte}/{total}"
+            response_headers["Content-Length"] = str(last_byte + 1)
+        else:
+            status_code = 200
+            if upstream_length:
+                response_headers["Content-Length"] = str(min(int(upstream_length), AUDIO_PROXY_CHUNK_BYTES))
+    else:
+        upstream.close()
+        raise HTTPException(status_code=502, detail="Unexpected upstream audio response")
+
+    limit_bytes = AUDIO_PROXY_CHUNK_BYTES
+    sent = 0
 
     def iter_bytes():
+        nonlocal sent
         try:
             for chunk in upstream.iter_content(chunk_size=64 * 1024):
-                if chunk:
-                    yield chunk
+                if not chunk:
+                    continue
+                remaining = limit_bytes - sent
+                if remaining <= 0:
+                    break
+                if len(chunk) > remaining:
+                    chunk = chunk[:remaining]
+                sent += len(chunk)
+                yield chunk
+                if sent >= limit_bytes:
+                    break
         finally:
             upstream.close()
 
-    passthrough_headers = {}
-    for h in ("Content-Length", "Content-Range", "Accept-Ranges", "Content-Type"):
-        if h in upstream.headers:
-            passthrough_headers[h] = upstream.headers[h]
-    passthrough_headers.setdefault("Accept-Ranges", "bytes")
-    passthrough_headers.setdefault("Content-Type", "audio/mp4")
-    passthrough_headers["Cache-Control"] = "no-store"
-
-    status_code = upstream.status_code if upstream.status_code in (200, 206) else 200
-    return StreamingResponse(iter_bytes(), status_code=status_code, headers=passthrough_headers)
+    return StreamingResponse(iter_bytes(), status_code=status_code, headers=response_headers)
 
 
 # --------------------------------------------------------------------------
 # Trending / discovery feed
 # --------------------------------------------------------------------------
 @app.get("/api/trending")
-async def trending(genre: Optional[str] = None, limit: int = 24):
+def trending(genre: Optional[str] = None, limit: int = Query(24, ge=1, le=50)):
     results = music.engine.trending(genre=genre, limit=limit)
     return {"genre": genre, "results": [s.to_public_dict() for s in results]}
 
@@ -395,13 +593,13 @@ async def trending(genre: Optional[str] = None, limit: int = 24):
 # open straight into /api/album/{id} with zero extra resolution needed.
 # --------------------------------------------------------------------------
 @app.get("/api/albums/trending")
-async def trending_albums(genre: Optional[str] = None, limit: int = 12):
+def trending_albums(genre: Optional[str] = None, limit: int = Query(12, ge=1, le=30)):
     albums = music.engine.trending_albums(genre=genre, limit=limit)
     return {"genre": genre, "results": [a.to_summary_dict() for a in albums]}
 
 
 @app.get("/api/albums/feed")
-async def personalized_album_feed(request: Request, response: Response, limit_per_genre: int = 6):
+def personalized_album_feed(request: Request, response: Response, limit_per_genre: int = 6):
     session_id, user = get_or_create_session(request, response)
     genres = (user.get("preferences") or {}).get("genres") or []
 
@@ -417,7 +615,7 @@ async def personalized_album_feed(request: Request, response: Response, limit_pe
 # Related songs -> autoplay "Up Next" queue
 # --------------------------------------------------------------------------
 @app.get("/api/related/{video_id}")
-async def related(video_id: str, limit: int = 15):
+def related(video_id: str, limit: int = 15):
     results = music.engine.related_songs(video_id, limit=limit)
     return {"seed": video_id, "results": [s.to_public_dict() for s in results]}
 
@@ -442,7 +640,7 @@ async def related(video_id: str, limit: int = 15):
 # tracklist has expired (see ALBUM_TTL_SECONDS in music.py).
 # --------------------------------------------------------------------------
 @app.get("/api/album/by-song/{video_id}")
-async def album_by_song(video_id: str, limit: int = 50):
+def album_by_song(video_id: str, limit: int = 50):
     album = music.engine.get_album_for_song(video_id, limit=limit)
     if not album:
         raise HTTPException(status_code=404, detail="Could not resolve an album for this song")
@@ -450,7 +648,7 @@ async def album_by_song(video_id: str, limit: int = 50):
 
 
 @app.get("/api/album/{album_id}")
-async def album_by_id(album_id: str, limit: int = 50):
+def album_by_id(album_id: str, limit: int = 50):
     album = music.engine.get_album_by_id(album_id, limit=limit)
     if not album or not album.track_ids:
         raise HTTPException(status_code=404, detail="Album not found")
@@ -458,7 +656,7 @@ async def album_by_id(album_id: str, limit: int = 50):
 
 
 @app.get("/api/album/{album_id}/preload")
-async def album_preload(album_id: str, limit: int = 5):
+def album_preload(album_id: str, limit: int = 5):
     """
     Warms the stream-URL cache for the first `limit` tracks of an album in
     the background threadpool as soon as the album view opens, so the first
@@ -492,7 +690,7 @@ async def album_preload(album_id: str, limit: int = 5):
 # Personalized home feed (built from onboarding preferences)
 # --------------------------------------------------------------------------
 @app.get("/api/feed")
-async def personalized_feed(request: Request, response: Response):
+def personalized_feed(request: Request, response: Response):
     session_id, user = get_or_create_session(request, response)
     genres = (user.get("preferences") or {}).get("genres") or []
 
@@ -508,7 +706,7 @@ async def personalized_feed(request: Request, response: Response):
 # User handling
 # --------------------------------------------------------------------------
 @app.post("/api/users/register")
-async def register(body: RegisterRequest, request: Request, response: Response):
+def register(body: RegisterRequest, request: Request, response: Response):
     """
     Registers/renames the current session's user. Since this project has
     no password requirement, "registering" simply claims a display name on
@@ -527,13 +725,13 @@ async def register(body: RegisterRequest, request: Request, response: Response):
 
 
 @app.get("/api/users/me")
-async def me(request: Request, response: Response):
+def me(request: Request, response: Response):
     session_id, user = get_or_create_session(request, response)
     return _public_user(user)
 
 
 @app.post("/api/users/preferences")
-async def set_preferences(body: PreferencesRequest, request: Request, response: Response):
+def set_preferences(body: PreferencesRequest, request: Request, response: Response):
     session_id, _user = get_or_create_session(request, response)
     valid_genres = [g for g in body.genres if g.lower() in AVAILABLE_GENRES] or body.genres
     users.update(
@@ -546,7 +744,7 @@ async def set_preferences(body: PreferencesRequest, request: Request, response: 
 
 
 @app.get("/api/users/history")
-async def history(request: Request, response: Response, limit: int = 50):
+def history(request: Request, response: Response, limit: int = 50):
     session_id, user = get_or_create_session(request, response)
     hist = (user.get("history") or [])[:limit]
     ids = [h["id"] for h in hist]
@@ -562,7 +760,7 @@ async def history(request: Request, response: Response, limit: int = 50):
 
 
 @app.post("/api/users/like")
-async def like_song(body: LikeRequest, request: Request, response: Response):
+def like_song(body: LikeRequest, request: Request, response: Response):
     session_id, _user = get_or_create_session(request, response)
     try:
         is_liked = users.toggle_like(session_id, body.song_id)
@@ -572,7 +770,7 @@ async def like_song(body: LikeRequest, request: Request, response: Response):
 
 
 @app.get("/api/users/liked")
-async def liked_songs(request: Request, response: Response):
+def liked_songs(request: Request, response: Response):
     session_id, user = get_or_create_session(request, response)
     ids = user.get("liked") or []
     songs = music.engine.bulk_get(ids)
@@ -599,7 +797,7 @@ def _public_user(user: dict) -> dict:
 # Global error handler -> always return clean JSON, never a raw 500 trace
 # --------------------------------------------------------------------------
 @app.exception_handler(Exception)
-async def all_exceptions_handler(request: Request, exc: Exception):
+def all_exceptions_handler(request: Request, exc: Exception):
     log.exception("Unhandled error on %s: %s", request.url.path, exc)
     return JSONResponse(status_code=500, content={"detail": "Internal server error. Please try again."})
 

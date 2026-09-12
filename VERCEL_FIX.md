@@ -1,31 +1,29 @@
-# SujalConnect — Vercel crash fix
+# SujalConnect — Vercel hardening summary
 
-## Root cause fixed
+This version includes the original startup fix plus playback and serverless hardening.
 
-The FastAPI module was trying to create `/static` beside the deployed source at import time:
+## Deployment/runtime fixes
 
-```python
-STATIC_DIR = BASE_DIR / "static"
-STATIC_DIR.mkdir(exist_ok=True)
-```
+- No runtime directory creation beside the deployed source bundle.
+- Cache and JSON user data use `/tmp/sujalconnect` on Vercel.
+- Root-level `app.py` is the FastAPI entrypoint.
+- Vercel function duration is configured to 300 seconds.
+- Blocking Python work is exposed through synchronous FastAPI handlers so FastAPI can run it in its worker pool.
+- CORS is disabled by default for same-origin deployment and can be enabled with `CORS_ORIGINS` when a split frontend is used.
 
-Vercel function source is read-only at runtime, so importing the app could fail before the first request and produce `500 FUNCTION_INVOCATION_FAILED`.
+## Playback fixes
 
-The deployment version now:
+- Current `yt-dlp[default]` with YouTube EJS support.
+- No hard-coded obsolete YouTube player client list.
+- Fresh media URL resolution with a short TTL.
+- Per-song resolution locking to prevent duplicate extractor calls.
+- Safe `User-Agent` / `Referer` / `Origin` headers from yt-dlp are retained server-side.
+- Audio proxy retries a fresh URL on stale/rejected upstream responses.
+- Proper HTTP 206 and 416 handling.
+- Bounded 2 MiB range responses for long serverless playback sessions.
+- Correct content type propagation instead of always claiming `audio/mp4`.
+- Frontend retries a failed track once before skipping.
 
-- never writes into the bundled project directory at runtime;
-- uses `/tmp/sujalconnect` for ephemeral cache/user data on Vercel;
-- only mounts `/static` if that directory is actually packaged;
-- creates runtime directories with `parents=True` under `/tmp`.
+## Persistence caveat
 
-## Deploy
-
-1. Replace the old project files with this package.
-2. Commit/push the changed files to the Git repository connected to Vercel, or deploy the folder with Vercel CLI.
-3. Redeploy.
-4. Open `/api/health` first. It should return JSON with `status: "ok"`.
-5. Then open `/`.
-
-## Important architecture note
-
-This removes the startup crash. User data and cache still live in ephemeral `/tmp` storage on Vercel, so they are not durable across function instances. For production, move accounts/history/likes to a managed database and shared cache.
+Vercel `/tmp` storage is ephemeral. Likes, history, users and caches are therefore runtime-local. For durable multi-instance production persistence, move the `UserStore` and shared cache to a managed database/cache.

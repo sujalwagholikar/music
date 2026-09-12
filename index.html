@@ -788,6 +788,28 @@ async function loadAndPlayCurrent(){
   }catch(e){
     if(myToken !== currentLoadToken) return;
     console.error(e);
+    // A server-side media URL can expire between /api/stream and the first
+    // byte request. Give the backend one fresh-resolution retry before we
+    // skip the track.
+    if(!loadAndPlayCurrent._retried){
+      loadAndPlayCurrent._retried = true;
+      try{
+        await api(`/api/stream/${encodeURIComponent(song.id)}?refresh=1`);
+        if(myToken === currentLoadToken){
+          audio.src = `/api/proxy-audio/${encodeURIComponent(song.id)}`;
+          audio.load();
+          await audio.play();
+          loadAndPlayCurrent._retried = false;
+          state.isPlaying = true;
+          updatePlayPauseIcon();
+          updatePlayerUI(song, false);
+          return;
+        }
+      }catch(retryErr){
+        console.warn('Playback retry failed', retryErr);
+      }
+    }
+    loadAndPlayCurrent._retried = false;
     showToast(`Couldn't play "${song.title}" — skipping to next`, true);
     setTimeout(()=>{ if(myToken===currentLoadToken) playNext(true); }, 700);
   }
@@ -894,7 +916,7 @@ audio.addEventListener('pause', () => { if(!audio.ended){ state.isPlaying=false;
 audio.addEventListener('ended', () => { playNext(true); });
 audio.addEventListener('error', () => {
   if(state.currentSong){
-    console.warn('Audio element error, attempting next track');
+    console.warn('Audio element error', audio.error);
   }
 });
 

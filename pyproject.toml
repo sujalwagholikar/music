@@ -1,13 +1,16 @@
 [project]
 name = "sujalconnect"
-version = "1.0.0"
-description = "SujalConnect music web app"
-requires-python = ">=3.12"
+version = "2.0.0"
+description = "SujalConnect music web app - Vercel hardened FastAPI deployment"
+requires-python = ">=3.12,<3.15"
 dependencies = [
   "fastapi>=0.115,<1",
   "uvicorn[standard]>=0.34,<1",
-  "yt-dlp>=2025.01.15",
+  "yt-dlp[default]>=2026.08.19,<2027",
   "requests>=2.32,<3",
   "pydantic>=2.10,<3",
   "python-multipart>=0.0.20,<1",
 ]
+
+[tool.vercel.fastapi.static]
+cdn = true
