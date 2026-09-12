@@ -69,7 +69,7 @@ BASE_DIR = Path(__file__).resolve().parent
 # continues to use ./data.
 RUNTIME_DIR = Path(os.environ.get("SUJALCONNECT_RUNTIME_DIR", "/tmp/sujalconnect" if os.environ.get("VERCEL") else str(BASE_DIR)))
 DATA_DIR = RUNTIME_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 USERS_DB_FILE = DATA_DIR / "users.json"
 SESSION_COOKIE_NAME = "sujal_session"
 
@@ -608,8 +608,11 @@ async def all_exceptions_handler(request: Request, exc: Exception):
 # Static mount for any extra assets (icons, generated files, etc.)
 # --------------------------------------------------------------------------
 STATIC_DIR = BASE_DIR / "static"
-STATIC_DIR.mkdir(exist_ok=True)
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+# Vercel deployment files are read-only at runtime. Do not attempt to create
+# directories beside the source bundle during function import. Mount the
+# directory only when it is actually packaged with the deployment.
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 if __name__ == "__main__":

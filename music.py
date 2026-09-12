@@ -68,7 +68,7 @@ BASE_DIR = Path(__file__).resolve().parent
 # caches in /tmp there; locally we retain the original project-local cache.
 RUNTIME_DIR = Path(os.environ.get("SUJALCONNECT_RUNTIME_DIR", "/tmp/sujalconnect" if os.environ.get("VERCEL") else str(BASE_DIR)))
 CACHE_DIR = RUNTIME_DIR / "cache"
-CACHE_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 METADATA_CACHE_FILE = CACHE_DIR / "metadata_cache.json"
 TRENDING_CACHE_FILE = CACHE_DIR / "trending_cache.json"
 ALBUM_CACHE_FILE = CACHE_DIR / "album_cache.json"
