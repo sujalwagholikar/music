@@ -3,11 +3,7 @@
   "functions": {
     "app.py": {
       "maxDuration": 300,
-      "includeFiles": [
-        "vendor/node",
-        "vendor/NODE_NOTICE.txt",
-        "*.html"
-      ]
+      "includeFiles": "vendor/**"
     }
   },
   "headers": [
