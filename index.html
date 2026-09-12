@@ -334,6 +334,15 @@ img{-webkit-user-drag:none;user-select:none;}
 .player-loading-spinner{
   width:16px;height:16px;border:2px solid rgba(0,0,0,.25);border-top-color:#000;border-radius:50%;animation:spin .7s linear infinite;
 }
+
+.youtube-fallback{position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.78);display:flex;align-items:center;justify-content:center;padding:24px;}
+.youtube-fallback.hidden{display:none;}
+.youtube-fallback-card{width:min(860px,96vw);background:var(--bg-1);border:1px solid var(--border);border-radius:18px;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.5);}
+.youtube-fallback-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border);}
+.youtube-fallback-title{font-weight:700;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.youtube-fallback-close{font-size:22px;padding:4px 10px;border-radius:10px;}
+.youtube-fallback-frame{display:block;width:100%;aspect-ratio:16/9;border:0;background:#000;}
+.youtube-fallback-note{padding:12px 16px;color:var(--text-tertiary);font-size:12px;}
 .progress-row{display:flex;align-items:center;gap:8px;width:100%;max-width:560px;}
 .time-label{font-size:11px;color:var(--text-tertiary);min-width:38px;text-align:center;font-variant-numeric:tabular-nums;}
 .progress-track{
@@ -644,6 +653,16 @@ img{-webkit-user-drag:none;user-select:none;}
   </div>
 </div>
 
+<div id="youtube-fallback" class="youtube-fallback hidden" role="dialog" aria-modal="true" aria-label="YouTube playback">
+  <div class="youtube-fallback-card">
+    <div class="youtube-fallback-head">
+      <div class="youtube-fallback-title" id="youtube-fallback-title">Playing from YouTube</div>
+      <button class="youtube-fallback-close" id="youtube-fallback-close" title="Close">×</button>
+    </div>
+    <iframe id="youtube-fallback-frame" class="youtube-fallback-frame" title="YouTube player" allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen></iframe>
+    <div class="youtube-fallback-note">Direct audio delivery is unavailable for this track from the server, so SujalConnect is using YouTube's official embedded player.</div>
+  </div>
+</div>
 <audio id="audio" preload="auto" crossorigin="anonymous"></audio>
 <div id="toast" class="hidden"></div>
 
@@ -757,6 +776,26 @@ async function fetchRelatedAndAppend(seedId){
 }
 
 let currentLoadToken = 0;
+function showYouTubeFallback(song, embedUrl){
+  try{ audio.pause(); }catch{}
+  audio.removeAttribute('src');
+  audio.load();
+  state.isPlaying = false;
+  updatePlayPauseIcon();
+  updatePlayerUI(song, false);
+  $('#youtube-fallback-title').textContent = `${song.title || 'YouTube playback'}${song.artist ? ' • ' + song.artist : ''}`;
+  $('#youtube-fallback-frame').src = embedUrl || `https://www.youtube.com/embed/${encodeURIComponent(song.id)}?autoplay=1&playsinline=1&rel=0`;
+  $('#youtube-fallback').classList.remove('hidden');
+}
+
+function hideYouTubeFallback(){
+  $('#youtube-fallback-frame').src = '';
+  $('#youtube-fallback').classList.add('hidden');
+}
+
+$('#youtube-fallback-close').addEventListener('click', hideYouTubeFallback);
+$('#youtube-fallback').addEventListener('click', e=>{ if(e.target.id==='youtube-fallback') hideYouTubeFallback(); });
+
 async function loadAudioSource(audioEl, directUrl, proxyUrl){
   // Try the freshly resolved direct media URL first. It keeps Vercel out of
   // the audio byte path. If the browser/source rejects it, fall back to our
@@ -816,6 +855,13 @@ async function loadAndPlayCurrent(){
       duration_str: data.duration_str || song.duration_str,
     });
 
+    if(data.playback_mode === 'youtube_embed'){
+      showYouTubeFallback(song, data.embed_url);
+      loadAndPlayCurrent._retried = false;
+      return;
+    }
+
+    hideYouTubeFallback();
     await loadAudioSource(
       audio,
       data.playback_url,
@@ -836,6 +882,12 @@ async function loadAndPlayCurrent(){
       try{
         const fresh = await api(`/api/stream/${encodeURIComponent(song.id)}?refresh=1`);
         if(myToken === currentLoadToken){
+          if(fresh.playback_mode === 'youtube_embed'){
+            showYouTubeFallback(song, fresh.embed_url);
+            loadAndPlayCurrent._retried = false;
+            return;
+          }
+          hideYouTubeFallback();
           await loadAudioSource(
             audio,
             fresh.playback_url,
@@ -852,8 +904,8 @@ async function loadAndPlayCurrent(){
       }
     }
     loadAndPlayCurrent._retried = false;
-    showToast(`Couldn't play "${song.title}" — skipping to next`, true);
-    setTimeout(()=>{ if(myToken===currentLoadToken) playNext(true); }, 700);
+    showYouTubeFallback(song, `https://www.youtube.com/embed/${encodeURIComponent(song.id)}?autoplay=1&playsinline=1&rel=0`);
+    showToast(`Direct audio isn't available for "${song.title}" — using YouTube playback`, false);
   }
 }
 

@@ -40,9 +40,14 @@ try:
     from yt_dlp import YoutubeDL
 except ImportError as e:  # pragma: no cover
     raise SystemExit(
-        "yt-dlp is not installed. Run:  pip install -U yt-dlp\n"
+        "yt-dlp is not installed. Run:  pip install -U yt-dlp[default]\n"
         f"Original error: {e}"
     )
+
+try:
+    import deno as _deno_pkg
+except ImportError:  # pragma: no cover
+    _deno_pkg = None
 
 try:
     import requests as _requests
@@ -288,6 +293,7 @@ class MusicEngine:
         self._album_cache: dict[str, Album] = {}  # album_id -> Album
         self._song_to_album: dict[str, str] = {}  # song_id -> album_id (fast reverse lookup)
         self._resolve_locks: dict[str, threading.Lock] = {}
+        self._last_resolve_error: dict[str, str] = {}
         self._load_persistent_cache()
         self._load_album_cache()
         log.info(
@@ -352,48 +358,43 @@ class MusicEngine:
         opts = dict(self._BASE_OPTS)
         opts["http_headers"] = dict(self._BASE_OPTS["http_headers"])
 
-        # YouTube now requires an external JS runtime for full extraction.
-        # Vercel's Python runtime does not guarantee that Deno/Node is on PATH,
-        # so this deployment ships a compatible Node runtime in vendor/node.
-        # Prefer an explicitly configured runtime, then a bundled runtime,
-        # then PATH-based runtimes. The bundled runtime is the critical
-        # serverless fix: without it, yt-dlp fails before returning a stream.
+        # yt-dlp's current YouTube extractor needs a supported JS runtime.
+        # For GitHub -> Vercel deployments we install the official Deno binary
+        # through the `deno` PyPI package rather than committing a large binary
+        # into the repository. This keeps the repository GitHub-safe while
+        # ensuring the Vercel Python function has a runtime available.
         try:
             import shutil
             import subprocess
+            candidates: list[tuple[str, Path]] = []
 
-            candidates = []
-            configured = os.environ.get("SUJALCONNECT_NODE_PATH")
+            configured = os.environ.get("SUJALCONNECT_DENO_PATH") or os.environ.get("SUJALCONNECT_NODE_PATH")
             if configured:
-                candidates.append(("node", Path(configured)))
+                candidates.append(("deno" if "DENO" in os.environ else "node", Path(configured)))
 
-            bundled = BASE_DIR / "vendor" / "node"
-            if bundled.exists():
-                # Some ZIP/upload paths can lose executable mode bits. If
-                # that happens, copy the known-good binary to writable /tmp
-                # and restore the mode there. This also avoids modifying the
-                # read-only deployed source bundle.
-                bundled_exec = bundled
-                if not os.access(bundled, os.X_OK):
-                    try:
-                        runtime_node = RUNTIME_DIR / "node"
-                        if (not runtime_node.exists()) or runtime_node.stat().st_size != bundled.stat().st_size:
-                            import shutil as _shutil
-                            _shutil.copy2(bundled, runtime_node)
-                        runtime_node.chmod(0o755)
-                        bundled_exec = runtime_node
-                    except Exception as exc:
-                        log.warning("Could not prepare bundled Node runtime: %s", exc)
-                if os.access(bundled_exec, os.X_OK):
-                    candidates.append(("node", bundled_exec))
+            if _deno_pkg is not None:
+                try:
+                    deno_bin = Path(_deno_pkg.find_deno_bin())
+                    candidates.insert(0, ("deno", deno_bin))
+                except Exception as exc:
+                    log.warning("Could not locate Deno from Python package: %s", exc)
 
             for name in ("deno", "node", "qjs"):
                 path = shutil.which(name)
                 if path:
                     candidates.append((name, Path(path)))
 
+            # De-duplicate candidates while preserving priority.
+            seen = set()
+            deduped = []
+            for item in candidates:
+                key = (item[0], str(item[1]))
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(item)
+
             selected = None
-            for runtime_name, runtime_path in candidates:
+            for runtime_name, runtime_path in deduped:
                 try:
                     probe = subprocess.run(
                         [str(runtime_path), "--version"],
@@ -416,13 +417,11 @@ class MusicEngine:
             else:
                 log.error(
                     "No supported JavaScript runtime found for yt-dlp. "
-                    "Set SUJALCONNECT_NODE_PATH or deploy vendor/node."
+                    "Install the deno dependency or set SUJALCONNECT_DENO_PATH."
                 )
 
-            # yt-dlp[default] bundles yt-dlp-ejs. Do not download EJS scripts
-            # from GitHub on every cold start; that makes Vercel resolution
-            # depend on a second external service. Allow an opt-in remote
-            # fallback through an environment variable only.
+            # EJS scripts are provided by yt-dlp[default]. GitHub EJS downloads
+            # remain opt-in only; they are not required for normal deployments.
             if os.environ.get("SUJALCONNECT_ALLOW_REMOTE_EJS") == "1":
                 opts["remote_components"] = ["ejs:github"]
         except Exception as exc:
@@ -595,19 +594,21 @@ class MusicEngine:
     # --------------------------------------------------------- diagnostics
     def runtime_info(self) -> dict:
         import shutil
-        runtimes = {}
-        for name in ("deno", "node", "qjs"):
-            runtimes[name] = shutil.which(name)
-        bundled = BASE_DIR / "vendor" / "node"
-        runtime_copy = RUNTIME_DIR / "node"
+        runtimes = {name: shutil.which(name) for name in ("deno", "node", "qjs")}
+        deno_bin = ""
+        deno_ok = False
+        if _deno_pkg is not None:
+            try:
+                deno_bin = str(_deno_pkg.find_deno_bin())
+                deno_ok = bool(deno_bin and os.path.exists(deno_bin))
+            except Exception:
+                pass
         return {
-            "bundled_node_exists": bundled.exists(),
-            "bundled_node_executable": os.access(bundled, os.X_OK),
-            "runtime_node_copy_exists": runtime_copy.exists(),
-            "runtime_node_copy_executable": os.access(runtime_copy, os.X_OK),
-            "bundled_node_path": str(bundled),
+            "deno_package_installed": _deno_pkg is not None,
+            "deno_binary": deno_bin,
+            "deno_binary_exists": deno_ok,
             "path_runtimes": runtimes,
-            "runtime_override": os.environ.get("SUJALCONNECT_NODE_PATH"),
+            "runtime_override": os.environ.get("SUJALCONNECT_DENO_PATH") or os.environ.get("SUJALCONNECT_NODE_PATH"),
             "remote_ejs": os.environ.get("SUJALCONNECT_ALLOW_REMOTE_EJS") == "1",
         }
 
@@ -656,8 +657,13 @@ class MusicEngine:
             try:
                 with self._ydl() as ydl:
                     info = ydl.extract_info(url, download=False)
+                with self._lock:
+                    self._last_resolve_error.pop(video_id, None)
             except Exception as e:
-                log.exception("Failed to resolve stream for %s [%s: %s]", video_id, type(e).__name__, e)
+                message = str(e) or f"{type(e).__name__}"
+                with self._lock:
+                    self._last_resolve_error[video_id] = message[:1200]
+                log.error("Failed to resolve stream for %s: %s", video_id, message)
                 return cached
 
             fresh = self._song_from_info(info)
@@ -677,6 +683,10 @@ class MusicEngine:
             self._cache_song(fresh)
             self._persist_cache_async()
             return fresh
+
+    def last_resolve_error(self, video_id: str) -> Optional[str]:
+        with self._lock:
+            return self._last_resolve_error.get(video_id)
 
     def invalidate_stream(self, video_id: str) -> None:
         with self._lock:

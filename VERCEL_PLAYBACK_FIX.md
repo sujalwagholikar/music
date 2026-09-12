@@ -6,7 +6,7 @@ The production logs showed repeated `/api/stream/{video_id}` 404 responses. Thos
 
 Current yt-dlp YouTube extraction requires a supported external JavaScript runtime. Local development already had Node.js, while the Vercel Python runtime did not reliably provide one on PATH. The app therefore failed inside `yt-dlp` before a stream URL could ever be returned.
 
-This version ships a Node.js v22 runtime in `vendor/node` and explicitly configures yt-dlp to use it. The deployed function also reports whether that runtime is present at `/api/runtime` and `/api/stream-debug/{id}`.
+This version ships a Node.js v22 runtime in `Deno installed from the `deno` Python package` and explicitly configures yt-dlp to use it. The deployed function also reports whether that runtime is present at `/api/runtime` and `/api/stream-debug/{id}`.
 
 ## Playback changes
 
@@ -22,10 +22,10 @@ This version ships a Node.js v22 runtime in `vendor/node` and explicitly configu
 
 ## Deployment notes
 
-- Python Vercel functions include the `vendor/node` binary via `includeFiles`.
+- Python Vercel functions include the `Deno installed from the `deno` Python package` binary via `includeFiles`.
 - The Node binary is x86_64; Vercel's Python function architecture defaults to x86_64 unless explicitly changed.
 - Keep the default Vercel function architecture for this package.
-- The Python bundle remains below Vercel's current standard Python uncompressed bundle size limit in normal deployments; large-functions is not required just for the bundled Node runtime.
+- The Python bundle remains below Vercel's current standard Python uncompressed bundle size limit in normal deployments; large-functions is not required just for the Deno runtime installed from the Python dependency.
 
 ## Diagnostics
 

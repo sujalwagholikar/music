@@ -363,7 +363,22 @@ def get_stream(video_id: str, request: Request, response: Response, refresh: boo
     session_id, _user = get_or_create_session(request, response)
     song = music.engine.get_stream_url(video_id, force_refresh=refresh)
     if not song or not song.stream_url:
-        raise HTTPException(status_code=404, detail="Could not resolve a playable stream for this song")
+        # YouTube may refuse server-side extraction from a shared cloud IP even
+        # when the same video plays normally in a user's browser. Do not turn
+        # this into an endless 404/skip loop; return a first-party YouTube
+        # embed fallback instead. This uses YouTube's supported playback path
+        # rather than trying to evade its anti-bot controls.
+        cached = music.engine.get_song_metadata(video_id)
+        error_text = music.engine.last_resolve_error(video_id) or "server-side stream unavailable"
+        if cached:
+            data = cached.to_public_dict(include_stream=False)
+            data["playback_mode"] = "youtube_embed"
+        else:
+            data = {"id": video_id, "title": "YouTube playback", "artist": "", "duration": 0, "duration_str": "0:00", "poster": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg", "audio_format": "", "source": "youtube", "album_id": None, "album_name": None, "track_number": None, "playback_mode": "youtube_embed"}
+        data["embed_url"] = f"https://www.youtube.com/embed/{video_id}?autoplay=1&playsinline=1&rel=0"
+        data["stream_error"] = error_text[:300]
+        users.add_history(session_id, video_id)
+        return data
 
     users.add_history(session_id, video_id)
 
@@ -390,6 +405,8 @@ def stream_debug(video_id: str, refresh: bool = False):
             "ok": False,
             "video_id": video_id,
             "detail": "yt-dlp could not resolve a playable stream",
+            "reason": music.engine.last_resolve_error(video_id),
+            "fallback": "youtube_embed",
             "engine": music.engine.runtime_info(),
         }
     return {
