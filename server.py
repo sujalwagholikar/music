@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import uuid
 from pathlib import Path
@@ -63,7 +64,11 @@ logging.basicConfig(
 log = logging.getLogger("sujalconnect.server")
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+# User data is ephemeral on Vercel unless replaced by a real database.
+# /tmp is writable during a function instance lifetime; local development
+# continues to use ./data.
+RUNTIME_DIR = Path(os.environ.get("SUJALCONNECT_RUNTIME_DIR", "/tmp/sujalconnect" if os.environ.get("VERCEL") else str(BASE_DIR)))
+DATA_DIR = RUNTIME_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 USERS_DB_FILE = DATA_DIR / "users.json"
 SESSION_COOKIE_NAME = "sujal_session"

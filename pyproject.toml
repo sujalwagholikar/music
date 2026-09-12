@@ -1,0 +1,13 @@
+[project]
+name = "sujalconnect"
+version = "1.0.0"
+description = "SujalConnect music web app"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.34,<1",
+  "yt-dlp>=2025.01.15",
+  "requests>=2.32,<3",
+  "pydantic>=2.10,<3",
+  "python-multipart>=0.0.20,<1",
+]

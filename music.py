@@ -64,7 +64,10 @@ log = logging.getLogger("sujalconnect.music")
 # Paths / persistent cache
 # --------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-CACHE_DIR = BASE_DIR / "cache"
+# Vercel's deployment filesystem is not a persistent writable disk. Keep
+# caches in /tmp there; locally we retain the original project-local cache.
+RUNTIME_DIR = Path(os.environ.get("SUJALCONNECT_RUNTIME_DIR", "/tmp/sujalconnect" if os.environ.get("VERCEL") else str(BASE_DIR)))
+CACHE_DIR = RUNTIME_DIR / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
 METADATA_CACHE_FILE = CACHE_DIR / "metadata_cache.json"
 TRENDING_CACHE_FILE = CACHE_DIR / "trending_cache.json"
