@@ -276,6 +276,7 @@ def runtime_info():
         "cwd_writable": os.access(str(BASE_DIR), os.W_OK),
         "stream_chunk_bytes": AUDIO_PROXY_CHUNK_BYTES,
         "max_duration_hint_seconds": 300,
+        "music_runtime": music.engine.runtime_info(),
     }
 
 
@@ -367,11 +368,40 @@ def get_stream(video_id: str, request: Request, response: Response, refresh: boo
     users.add_history(session_id, video_id)
 
     data = song.to_public_dict(include_stream=False)
-    # We give the frontend OUR proxy URL, not the raw googlevideo URL --
-    # this sidesteps CORS issues, URL expiry mid-playback edge cases, and
-    # keeps YouTube's real URL off the wire to the browser.
-    data["playback_url"] = f"/api/proxy-audio/{video_id}"
+    # Prefer the freshly resolved media URL directly in the browser. This
+    # keeps Vercel out of the hot audio path and avoids Vercel->YouTube egress
+    # failures for media requests. The server proxy remains available as a
+    # fallback for sources that require replay headers.
+    data["playback_url"] = song.stream_url
+    data["proxy_url"] = f"/api/proxy-audio/{video_id}"
+    data["expires_at"] = song.stream_fetched_at + music.STREAM_URL_TTL_SECONDS
     return data
+
+
+# --------------------------------------------------------------------------
+# Stream diagnostics (never exposes the direct media URL)
+# --------------------------------------------------------------------------
+@app.get("/api/stream-debug/{video_id}")
+def stream_debug(video_id: str, refresh: bool = False):
+    video_id = _validate_video_id(video_id)
+    song = music.engine.get_stream_url(video_id, force_refresh=refresh)
+    if not song or not song.stream_url:
+        return {
+            "ok": False,
+            "video_id": video_id,
+            "detail": "yt-dlp could not resolve a playable stream",
+            "engine": music.engine.runtime_info(),
+        }
+    return {
+        "ok": True,
+        "video_id": video_id,
+        "title": song.title,
+        "audio_format": song.audio_format,
+        "resolved_at": song.stream_fetched_at,
+        "expires_at": song.stream_fetched_at + music.STREAM_URL_TTL_SECONDS,
+        "has_replay_headers": bool(song.stream_headers),
+        "engine": music.engine.runtime_info(),
+    }
 
 
 # --------------------------------------------------------------------------

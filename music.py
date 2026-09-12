@@ -352,23 +352,81 @@ class MusicEngine:
         opts = dict(self._BASE_OPTS)
         opts["http_headers"] = dict(self._BASE_OPTS["http_headers"])
 
-        # yt-dlp's current YouTube extractor uses external JS challenge
-        # solving when a supported JS runtime is available. On Vercel we do
-        # not assume one exists, so detect it instead of hard-coding a path.
+        # YouTube now requires an external JS runtime for full extraction.
+        # Vercel's Python runtime does not guarantee that Deno/Node is on PATH,
+        # so this deployment ships a compatible Node runtime in vendor/node.
+        # Prefer an explicitly configured runtime, then a bundled runtime,
+        # then PATH-based runtimes. The bundled runtime is the critical
+        # serverless fix: without it, yt-dlp fails before returning a stream.
         try:
             import shutil
-            runtimes = []
+            import subprocess
+
+            candidates = []
+            configured = os.environ.get("SUJALCONNECT_NODE_PATH")
+            if configured:
+                candidates.append(("node", Path(configured)))
+
+            bundled = BASE_DIR / "vendor" / "node"
+            if bundled.exists():
+                # Some ZIP/upload paths can lose executable mode bits. If
+                # that happens, copy the known-good binary to writable /tmp
+                # and restore the mode there. This also avoids modifying the
+                # read-only deployed source bundle.
+                bundled_exec = bundled
+                if not os.access(bundled, os.X_OK):
+                    try:
+                        runtime_node = RUNTIME_DIR / "node"
+                        if (not runtime_node.exists()) or runtime_node.stat().st_size != bundled.stat().st_size:
+                            import shutil as _shutil
+                            _shutil.copy2(bundled, runtime_node)
+                        runtime_node.chmod(0o755)
+                        bundled_exec = runtime_node
+                    except Exception as exc:
+                        log.warning("Could not prepare bundled Node runtime: %s", exc)
+                if os.access(bundled_exec, os.X_OK):
+                    candidates.append(("node", bundled_exec))
+
             for name in ("deno", "node", "qjs"):
                 path = shutil.which(name)
                 if path:
-                    runtimes.append(f"{name}:{path}")
-            if runtimes:
-                opts["js_runtimes"] = runtimes
-            # Allow the bundled/installed EJS package to satisfy the runtime
-            # without failing hard if a remote source is unavailable.
-            opts["remote_components"] = ["ejs:github"]
-        except Exception:
-            pass
+                    candidates.append((name, Path(path)))
+
+            selected = None
+            for runtime_name, runtime_path in candidates:
+                try:
+                    probe = subprocess.run(
+                        [str(runtime_path), "--version"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        timeout=3,
+                        check=False,
+                    )
+                    if probe.returncode == 0:
+                        selected = (runtime_name, str(runtime_path), probe.stdout.strip())
+                        break
+                except Exception:
+                    continue
+
+            if selected:
+                runtime_name, runtime_path, runtime_version = selected
+                opts["js_runtimes"] = [f"{runtime_name}:{runtime_path}"]
+                log.info("yt-dlp JS runtime: %s (%s)", runtime_name, runtime_version)
+            else:
+                log.error(
+                    "No supported JavaScript runtime found for yt-dlp. "
+                    "Set SUJALCONNECT_NODE_PATH or deploy vendor/node."
+                )
+
+            # yt-dlp[default] bundles yt-dlp-ejs. Do not download EJS scripts
+            # from GitHub on every cold start; that makes Vercel resolution
+            # depend on a second external service. Allow an opt-in remote
+            # fallback through an environment variable only.
+            if os.environ.get("SUJALCONNECT_ALLOW_REMOTE_EJS") == "1":
+                opts["remote_components"] = ["ejs:github"]
+        except Exception as exc:
+            log.warning("Could not configure yt-dlp JS runtime: %s", exc)
 
         if extra_opts:
             # Preserve nested dicts where appropriate
@@ -534,6 +592,25 @@ class MusicEngine:
     def _persist_cache_async(self):
         threading.Thread(target=self._persist_cache, daemon=True).start()
 
+    # --------------------------------------------------------- diagnostics
+    def runtime_info(self) -> dict:
+        import shutil
+        runtimes = {}
+        for name in ("deno", "node", "qjs"):
+            runtimes[name] = shutil.which(name)
+        bundled = BASE_DIR / "vendor" / "node"
+        runtime_copy = RUNTIME_DIR / "node"
+        return {
+            "bundled_node_exists": bundled.exists(),
+            "bundled_node_executable": os.access(bundled, os.X_OK),
+            "runtime_node_copy_exists": runtime_copy.exists(),
+            "runtime_node_copy_executable": os.access(runtime_copy, os.X_OK),
+            "bundled_node_path": str(bundled),
+            "path_runtimes": runtimes,
+            "runtime_override": os.environ.get("SUJALCONNECT_NODE_PATH"),
+            "remote_ejs": os.environ.get("SUJALCONNECT_ALLOW_REMOTE_EJS") == "1",
+        }
+
     # --------------------------------------------------------- resolution
     def get_stream_url(self, video_id: str, force_refresh: bool = False) -> Optional[Song]:
         """Resolve a fresh direct audio source for ``video_id``.
@@ -580,7 +657,7 @@ class MusicEngine:
                 with self._ydl() as ydl:
                     info = ydl.extract_info(url, download=False)
             except Exception as e:
-                log.error("Failed to resolve stream for %s: %s", video_id, e)
+                log.exception("Failed to resolve stream for %s [%s: %s]", video_id, type(e).__name__, e)
                 return cached
 
             fresh = self._song_from_info(info)

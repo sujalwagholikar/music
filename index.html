@@ -757,6 +757,44 @@ async function fetchRelatedAndAppend(seedId){
 }
 
 let currentLoadToken = 0;
+async function loadAudioSource(audioEl, directUrl, proxyUrl){
+  // Try the freshly resolved direct media URL first. It keeps Vercel out of
+  // the audio byte path. If the browser/source rejects it, fall back to our
+  // server proxy, which can replay yt-dlp headers.
+  const candidates = [directUrl, proxyUrl].filter(Boolean);
+  let lastErr = null;
+  for(const url of candidates){
+    try{
+      audioEl.pause();
+      audioEl.removeAttribute('src');
+      audioEl.load();
+      audioEl.src = url;
+      audioEl.load();
+      await new Promise((resolve,reject)=>{
+        let settled = false;
+        const cleanup = () => {
+          audioEl.removeEventListener('canplay', onReady);
+          audioEl.removeEventListener('loadedmetadata', onReady);
+          audioEl.removeEventListener('error', onError);
+          clearTimeout(timer);
+        };
+        const onReady = () => { if(!settled){ settled=true; cleanup(); resolve(); } };
+        const onError = () => { if(!settled){ settled=true; cleanup(); reject(audioEl.error || new Error('audio source error')); } };
+        const timer = setTimeout(() => onError(), 15000);
+        audioEl.addEventListener('canplay', onReady, {once:true});
+        audioEl.addEventListener('loadedmetadata', onReady, {once:true});
+        audioEl.addEventListener('error', onError, {once:true});
+      });
+      await audioEl.play();
+      return url;
+    }catch(err){
+      console.warn('Audio source failed', url, err);
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('No playable audio source');
+}
+
 async function loadAndPlayCurrent(){
   const song = state.queue[state.queueIndex];
   if(!song) return;
@@ -767,10 +805,9 @@ async function loadAndPlayCurrent(){
   setPlayingCardHighlight(song.id);
 
   try{
-    const data = await api(`/api/stream/${encodeURIComponent(song.id)}`);
-    if(myToken !== currentLoadToken) return; // a newer load superseded this one
+    let data = await api(`/api/stream/${encodeURIComponent(song.id)}`);
+    if(myToken !== currentLoadToken) return;
 
-    // merge richer metadata (poster/duration might be more accurate now)
     Object.assign(song, {
       title: data.title || song.title,
       artist: data.artist || song.artist,
@@ -779,26 +816,31 @@ async function loadAndPlayCurrent(){
       duration_str: data.duration_str || song.duration_str,
     });
 
-    audio.src = data.playback_url;
-    audio.load();
-    await audio.play();
+    await loadAudioSource(
+      audio,
+      data.playback_url,
+      `${location.origin}${data.proxy_url || `/api/proxy-audio/${encodeURIComponent(song.id)}`}`
+    );
+    if(myToken !== currentLoadToken) return;
     state.isPlaying = true;
+    loadAndPlayCurrent._retried = false;
     updatePlayPauseIcon();
     updatePlayerUI(song, false);
   }catch(e){
     if(myToken !== currentLoadToken) return;
-    console.error(e);
-    // A server-side media URL can expire between /api/stream and the first
-    // byte request. Give the backend one fresh-resolution retry before we
-    // skip the track.
+    console.error('Playback failed', e);
+    // Re-resolve once because YouTube media leases can expire or be rejected
+    // between extraction and the browser's first request.
     if(!loadAndPlayCurrent._retried){
       loadAndPlayCurrent._retried = true;
       try{
-        await api(`/api/stream/${encodeURIComponent(song.id)}?refresh=1`);
+        const fresh = await api(`/api/stream/${encodeURIComponent(song.id)}?refresh=1`);
         if(myToken === currentLoadToken){
-          audio.src = `/api/proxy-audio/${encodeURIComponent(song.id)}`;
-          audio.load();
-          await audio.play();
+          await loadAudioSource(
+            audio,
+            fresh.playback_url,
+            `${location.origin}${fresh.proxy_url || `/api/proxy-audio/${encodeURIComponent(song.id)}`}`
+          );
           loadAndPlayCurrent._retried = false;
           state.isPlaying = true;
           updatePlayPauseIcon();
@@ -806,7 +848,7 @@ async function loadAndPlayCurrent(){
           return;
         }
       }catch(retryErr){
-        console.warn('Playback retry failed', retryErr);
+        console.warn('Playback fresh-resolution retry failed', retryErr);
       }
     }
     loadAndPlayCurrent._retried = false;
