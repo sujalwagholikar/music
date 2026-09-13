@@ -30,8 +30,6 @@ import logging
 import os
 import random
 import re
-import shutil
-import subprocess
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -42,19 +40,19 @@ try:
     from yt_dlp import YoutubeDL
 except ImportError as e:  # pragma: no cover
     raise SystemExit(
-        "yt-dlp is not installed. Run:  pip install -U yt-dlp[default]\n"
+        "yt-dlp is not installed. Run:  pip install -U yt-dlp\n"
         f"Original error: {e}"
     )
-
-try:
-    import deno as _deno_pkg
-except ImportError:  # pragma: no cover
-    _deno_pkg = None
 
 try:
     import requests as _requests
 except ImportError:  # pragma: no cover
     _requests = None
+
+try:
+    import store as _store  # Redis (Upstash)-backed cross-instance cache
+except ImportError:  # pragma: no cover
+    _store = None
 
 # --------------------------------------------------------------------------
 # Logging
@@ -70,12 +68,21 @@ log = logging.getLogger("sujalconnect.music")
 # --------------------------------------------------------------------------
 # Paths / persistent cache
 # --------------------------------------------------------------------------
+# NOTE ON VERCEL: the project source directory is a read-only bundle at
+# runtime, so we never write cache files next to this module. Instead we use
+# /tmp, which Vercel Functions provide as writable scratch space (up to
+# 512MB by default) -- but /tmp is LOCAL TO ONE FUNCTION INSTANCE and is
+# wiped on cold start, so this is purely a same-instance speed optimization,
+# never a source of truth. Cross-instance/cross-restart caching (the thing
+# that actually matters for cost/perf under real traffic) is handled by
+# Redis in store.py, which MusicEngine consults first (see get_stream_url,
+# get_song_metadata, search) before ever falling through to yt-dlp.
 BASE_DIR = Path(__file__).resolve().parent
-# Vercel's deployment filesystem is not a persistent writable disk. Keep
-# caches in /tmp there; locally we retain the original project-local cache.
-RUNTIME_DIR = Path(os.environ.get("SUJALCONNECT_RUNTIME_DIR", "/tmp/sujalconnect" if os.environ.get("VERCEL") else str(BASE_DIR)))
-CACHE_DIR = RUNTIME_DIR / "cache"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR = Path(os.environ.get("SUJAL_CACHE_DIR", "/tmp/sujalconnect_cache"))
+try:
+    CACHE_DIR.mkdir(exist_ok=True, parents=True)
+except OSError:
+    CACHE_DIR = Path("/tmp")
 METADATA_CACHE_FILE = CACHE_DIR / "metadata_cache.json"
 TRENDING_CACHE_FILE = CACHE_DIR / "trending_cache.json"
 ALBUM_CACHE_FILE = CACHE_DIR / "album_cache.json"
@@ -83,7 +90,7 @@ ALBUM_CACHE_FILE = CACHE_DIR / "album_cache.json"
 # Stream URLs from YouTube expire (~6 hours typically). We cache metadata
 # (poster, title, artist, duration, video id) essentially forever, but we
 # always re-resolve the actual playable stream URL if it's older than this:
-STREAM_URL_TTL_SECONDS = 60 * 20  # 3 hours, safely inside YouTube's window
+STREAM_URL_TTL_SECONDS = 60 * 60 * 3  # 3 hours, safely inside YouTube's window
 METADATA_TTL_SECONDS = 60 * 60 * 24 * 14  # 2 weeks
 ALBUM_TTL_SECONDS = 60 * 60 * 24 * 7  # 1 week -- album tracklists rarely change
 
@@ -103,7 +110,6 @@ class Song:
     poster: str  # high-res thumbnail / "album art"
     stream_url: Optional[str] = None
     stream_fetched_at: float = 0.0
-    stream_headers: dict[str, str] = field(default_factory=dict, repr=False)
     audio_format: str = "m4a"
     bitrate: Optional[float] = None
     source: str = "youtube"
@@ -253,65 +259,6 @@ def _best_thumbnail(thumbnails: list[dict]) -> str:
 # --------------------------------------------------------------------------
 # Core engine
 # --------------------------------------------------------------------------
-
-def _find_js_runtime() -> tuple[str, str, str] | None:
-    """Locate a real JavaScript runtime executable for yt-dlp.
-
-    Vercel's Python runtime does not guarantee that `deno`, `node`, or `qjs`
-    exists on PATH. The deployment build downloads a Linux Deno executable to
-    `vendor/deno`, which is intentionally ignored by Git so GitHub stays
-    lightweight while the Vercel build artifact still contains the runtime.
-    """
-    candidates: list[tuple[str, Path]] = []
-
-    env_candidates = [
-        ("deno", os.environ.get("SUJALCONNECT_DENO_PATH")),
-        ("node", os.environ.get("SUJALCONNECT_NODE_PATH")),
-        ("qjs", os.environ.get("SUJALCONNECT_QJS_PATH")),
-    ]
-    for name, configured in env_candidates:
-        if configured:
-            p = Path(configured).expanduser()
-            candidates.append((name, p))
-
-    bundled_deno = Path(__file__).resolve().parent / "vendor" / "deno"
-    candidates.append(("deno", bundled_deno))
-
-    for name in ("deno", "node", "qjs", "quickjs"):
-        found = shutil.which(name)
-        if found:
-            candidates.append(("quickjs" if name == "quickjs" else name, Path(found)))
-
-    seen: set[tuple[str, str]] = set()
-    for runtime_name, runtime_path in candidates:
-        key = (runtime_name, str(runtime_path))
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            if not runtime_path.exists() or not runtime_path.is_file():
-                continue
-            if not os.access(runtime_path, os.X_OK):
-                try:
-                    runtime_path.chmod(runtime_path.stat().st_mode | 0o111)
-                except Exception:
-                    continue
-            probe = subprocess.run(
-                [str(runtime_path), "--version"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=3,
-                check=False,
-            )
-            if probe.returncode == 0:
-                return runtime_name, str(runtime_path), probe.stdout.strip()
-        except Exception:
-            continue
-
-    return None
-
-
 class MusicEngine:
     """
     Thread-safe wrapper around yt-dlp providing search, stream resolution,
@@ -326,24 +273,30 @@ class MusicEngine:
         "skip_download": True,
         "extract_flat": False,
         "geo_bypass": True,
-        "socket_timeout": 20,
-        "retries": 2,
-        "extractor_retries": 2,
-        "fragment_retries": 2,
-        "file_access_retries": 2,
+        "nocheckcertificate": True,
+        "socket_timeout": 15,
+        "source_address": "0.0.0.0",
+        # Prefer m4a (AAC) since it's broadly seekable/streamable in <audio>
+        # tags across browsers without extra transcoding, while still HQ.
         "format": (
             "bestaudio[ext=m4a][abr<=256]/"
             "bestaudio[ext=m4a]/"
             "bestaudio[acodec^=mp4a]/"
             "bestaudio/best"
         ),
+        "extractor_args": {
+            "youtube": {
+                # 'android'/'ios' clients are far less likely to be throttled
+                # or blocked than 'web', and usually return direct googlevideo
+                # URLs that work great in an HTML5 <audio> element.
+                "player_client": ["android", "web"],
+            }
+        },
         "http_headers": {
             "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/128.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
         },
     }
 
@@ -353,8 +306,6 @@ class MusicEngine:
         self._search_cache: dict[str, tuple[float, list[str]]] = {}  # query -> (ts, [song_ids])
         self._album_cache: dict[str, Album] = {}  # album_id -> Album
         self._song_to_album: dict[str, str] = {}  # song_id -> album_id (fast reverse lookup)
-        self._resolve_locks: dict[str, threading.Lock] = {}
-        self._last_resolve_error: dict[str, str] = {}
         self._load_persistent_cache()
         self._load_album_cache()
         log.info(
@@ -363,89 +314,105 @@ class MusicEngine:
         )
 
     # ---------------------------------------------------------------- I/O
+    #
+    # SERVERLESS NOTE: on Vercel, each function instance starts with an
+    # empty in-memory `_song_cache`/`_album_cache`. Rather than trying to
+    # bulk-load "everything" up front (which doesn't scale and isn't how
+    # Redis is meant to be used), we now cache per-song and per-album under
+    # individual Redis keys, fetched lazily the first time this instance
+    # needs them (see _cache_song / _persist_album, and the read-through
+    # helpers get_song_metadata / get_album_by_id below). This means:
+    #   - First request for a song on a cold instance -> yt-dlp resolve.
+    #   - Every subsequent request for that song, from ANY instance,
+    #     anywhere -> a single fast Redis GET, no yt-dlp call at all.
+    # The old bulk load/persist-everything-to-one-file methods are kept as
+    # harmless no-ops (still called from __init__) so the rest of the class
+    # doesn't need restructuring.
     def _load_persistent_cache(self):
-        if METADATA_CACHE_FILE.exists():
-            try:
-                raw = json.loads(METADATA_CACHE_FILE.read_text(encoding="utf-8"))
-                for sid, data in raw.items():
-                    data = dict(data)
-                    data.pop("stream_url", None)  # never trust old stream urls
-                    data["stream_headers"] = {}
-                    data["stream_fetched_at"] = 0.0
-                    self._song_cache[sid] = Song(**data)
-            except Exception as e:
-                log.warning("Could not load metadata cache: %s", e)
+        pass  # replaced by lazy, per-key Redis reads (see _cache_song)
 
     def _persist_cache(self):
-        try:
-            with self._lock:
-                serializable = {
-                    sid: {**asdict(s), "stream_url": None, "stream_headers": {}}
-                    for sid, s in self._song_cache.items()
-                }
-            METADATA_CACHE_FILE.write_text(
-                json.dumps(serializable, ensure_ascii=False), encoding="utf-8"
-            )
-        except Exception as e:
-            log.warning("Could not persist metadata cache: %s", e)
+        pass  # replaced by lazy, per-key Redis writes (see _cache_song)
 
     def _load_album_cache(self):
-        if ALBUM_CACHE_FILE.exists():
-            try:
-                raw = json.loads(ALBUM_CACHE_FILE.read_text(encoding="utf-8"))
-                for aid, data in raw.items():
-                    album = Album(**data)
-                    self._album_cache[aid] = album
-                    for tid in album.track_ids:
-                        self._song_to_album[tid] = aid
-            except Exception as e:
-                log.warning("Could not load album cache: %s", e)
+        pass  # replaced by lazy, per-key Redis reads (see get_album_by_id)
 
     def _persist_album_cache(self):
+        pass  # replaced by lazy, per-key Redis writes (see _cache_album)
+
+    @staticmethod
+    def _song_redis_key(song_id: str) -> str:
+        return f"sujal:song:{song_id}"
+
+    @staticmethod
+    def _album_redis_key(album_id: str) -> str:
+        return f"sujal:album:{album_id}"
+
+    def _redis_get_song(self, song_id: str) -> Optional["Song"]:
+        if not _store:
+            return None
+        data = _store.kv_get_json(self._song_redis_key(song_id))
+        if not data:
+            return None
         try:
-            with self._lock:
-                serializable = {aid: asdict(a) for aid, a in self._album_cache.items()}
-            ALBUM_CACHE_FILE.write_text(
-                json.dumps(serializable, ensure_ascii=False), encoding="utf-8"
+            data.pop("stream_url", None)  # never trust a cached stream URL -- may have expired
+            data["stream_fetched_at"] = 0.0
+            return Song(**data)
+        except Exception:
+            return None
+
+    def _redis_put_song(self, song: "Song"):
+        if not _store:
+            return
+        try:
+            data = {**asdict(song), "stream_url": None}
+            _store.kv_set_json(
+                self._song_redis_key(song.id), data, ex=METADATA_TTL_SECONDS
             )
         except Exception as e:
-            log.warning("Could not persist album cache: %s", e)
+            log.warning("redis put song failed for %s: %s", song.id, e)
 
-    def _persist_album_cache_async(self):
-        threading.Thread(target=self._persist_album_cache, daemon=True).start()
+    def _redis_get_album(self, album_id: str) -> Optional["Album"]:
+        if not _store:
+            return None
+        data = _store.kv_get_json(self._album_redis_key(album_id))
+        if not data:
+            return None
+        try:
+            return Album(**data)
+        except Exception:
+            return None
+
+    def _redis_put_album(self, album: "Album"):
+        if not _store:
+            return
+        try:
+            _store.kv_set_json(
+                self._album_redis_key(album.id), asdict(album), ex=ALBUM_TTL_SECONDS
+            )
+        except Exception as e:
+            log.warning("redis put album failed for %s: %s", album.id, e)
+
+    def _persist_album_cache_async(self, album: Optional["Album"] = None):
+        """
+        Write-through to Redis for a single album (or, if not given, every
+        album currently in memory -- used only as a fallback for older call
+        sites). Run in a background thread so the HTTP response isn't held
+        up by the Redis round-trip.
+        """
+        if album is not None:
+            threading.Thread(target=self._redis_put_album, args=(album,), daemon=True).start()
+            return
+        with self._lock:
+            albums = list(self._album_cache.values())
+        for a in albums:
+            threading.Thread(target=self._redis_put_album, args=(a,), daemon=True).start()
 
     # ----------------------------------------------------------- internals
     def _ydl(self, extra_opts: Optional[dict] = None) -> YoutubeDL:
         opts = dict(self._BASE_OPTS)
-        opts["http_headers"] = dict(self._BASE_OPTS["http_headers"])
-
-        # yt-dlp's current YouTube extractor needs a supported JS runtime.
-        # The Vercel build downloads a Linux Deno binary into vendor/deno, so
-        # the function does not depend on a system-wide runtime being present.
-        try:
-            selected = _find_js_runtime()
-            if selected:
-                runtime_name, runtime_path, runtime_version = selected
-                opts["js_runtimes"] = [f"{runtime_name}:{runtime_path}"]
-                log.info("yt-dlp JS runtime: %s (%s)", runtime_name, runtime_version)
-            else:
-                log.error(
-                    "No supported JavaScript runtime found for yt-dlp. "
-                    "Expected bundled vendor/deno or SUJALCONNECT_DENO_PATH."
-                )
-
-            if os.environ.get("SUJALCONNECT_ALLOW_REMOTE_EJS") == "1":
-                opts["remote_components"] = ["ejs:github"]
-        except Exception as exc:
-            log.warning("Could not configure yt-dlp JS runtime: %s", exc)
-
         if extra_opts:
-            # Preserve nested dicts where appropriate
-            for key, value in extra_opts.items():
-                if key == "http_headers" and isinstance(value, dict):
-                    opts["http_headers"].update(value)
-                else:
-                    opts[key] = value
+            opts.update(extra_opts)
         return YoutubeDL(opts)
 
     def _song_from_info(self, info: dict) -> Song:
@@ -461,18 +428,6 @@ class MusicEngine:
         stream_url = info.get("url")
         abr = info.get("abr")
         ext = info.get("ext", "m4a")
-
-        # Keep only headers that are useful when replaying a resolved media
-        # URL. Do not persist cookies or authorization tokens. In particular,
-        # YouTube media URLs may require the Referer/User-Agent that yt-dlp
-        # used when extracting them; dropping those headers can produce a
-        # 403 on the Vercel side even though local playback works.
-        raw_headers = info.get("http_headers") or {}
-        allowed_headers = {"User-Agent", "Referer", "Origin", "Accept", "Accept-Language"}
-        stream_headers = {
-            str(k): str(v) for k, v in raw_headers.items()
-            if str(k).title() in {h.title() for h in allowed_headers}
-        }
 
         # yt-dlp surfaces YouTube Music release metadata on many extractions:
         # `album` (name), `track` (clean track title), `artists`/`artist`,
@@ -499,7 +454,6 @@ class MusicEngine:
             poster=poster,
             stream_url=stream_url,
             stream_fetched_at=time.time() if stream_url else 0.0,
-            stream_headers=stream_headers,
             audio_format=ext,
             bitrate=abr,
             view_count=info.get("view_count"),
@@ -511,11 +465,10 @@ class MusicEngine:
 
     def _cache_song(self, song: Song):
         with self._lock:
-            existing = self._song_cache.get(song.id)
+            existing = self._song_cache.get(song.id) or self._redis_get_song(song.id)
             if existing and not song.stream_url:
                 song.stream_url = existing.stream_url
                 song.stream_fetched_at = existing.stream_fetched_at
-                song.stream_headers = dict(existing.stream_headers)
             # Never let a partial/flat re-fetch erase album info we already
             # resolved for this song (e.g. via full extraction or the album
             # resolver itself, which is a stronger signal than search flat entries).
@@ -526,6 +479,8 @@ class MusicEngine:
             self._song_cache[song.id] = song
             if song.album_id:
                 self._song_to_album[song.id] = song.album_id
+        # Write-through to Redis so other/future instances skip yt-dlp too.
+        self._redis_put_song(song)
 
     # ------------------------------------------------------------- search
     def search(self, query: str, limit: int = 20) -> list[Song]:
@@ -603,118 +558,77 @@ class MusicEngine:
     def _persist_cache_async(self):
         threading.Thread(target=self._persist_cache, daemon=True).start()
 
-    # --------------------------------------------------------- diagnostics
-    def runtime_info(self) -> dict:
-        runtime = _find_js_runtime()
-        bundled_deno = Path(__file__).resolve().parent / "vendor" / "deno"
-        deno_pkg = _deno_pkg is not None
-        return {
-            "deno_package_installed": deno_pkg,
-            "bundled_deno_path": str(bundled_deno),
-            "bundled_deno_exists": bundled_deno.exists(),
-            "bundled_deno_executable": os.access(bundled_deno, os.X_OK) if bundled_deno.exists() else False,
-            "selected_runtime": runtime[0] if runtime else None,
-            "selected_runtime_path": runtime[1] if runtime else None,
-            "selected_runtime_version": runtime[2] if runtime else None,
-            "runtime_override": (
-                os.environ.get("SUJALCONNECT_DENO_PATH")
-                or os.environ.get("SUJALCONNECT_NODE_PATH")
-                or os.environ.get("SUJALCONNECT_QJS_PATH")
-            ),
-            "remote_ejs": os.environ.get("SUJALCONNECT_ALLOW_REMOTE_EJS") == "1",
-        }
-
     # --------------------------------------------------------- resolution
-    def get_stream_url(self, video_id: str, force_refresh: bool = False) -> Optional[Song]:
-        """Resolve a fresh direct audio source for ``video_id``.
-
-        A media URL is intentionally treated as a short-lived lease rather
-        than durable metadata. ``force_refresh=True`` is used by the audio
-        proxy after an upstream 403/404/410/5xx so an expired Googlevideo URL
-        is not reused. Per-video locks prevent a burst of concurrent playback
-        requests from launching duplicate yt-dlp resolutions.
+    def get_stream_url(self, video_id: str) -> Optional[Song]:
         """
-        video_id = (video_id or "").strip()
-        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
-            return None
-
+        Resolve (or re-resolve if stale) the direct playable stream URL for
+        a given video id, returning the fully-populated Song. This is the
+        function server.py calls right before playback so the URL is fresh.
+        """
         with self._lock:
             cached = self._song_cache.get(video_id)
-            resolve_lock = self._resolve_locks.setdefault(video_id, threading.Lock())
 
-        # Short media-URL cache. Metadata itself remains much longer lived.
         needs_fetch = (
-            force_refresh
-            or cached is None
+            cached is None
             or not cached.stream_url
             or (time.time() - cached.stream_fetched_at) > STREAM_URL_TTL_SECONDS
         )
+
         if not needs_fetch:
             return cached
 
-        with resolve_lock:
-            # Another request may have refreshed the URL while we waited.
-            with self._lock:
-                cached = self._song_cache.get(video_id)
-            if (
-                cached
-                and not force_refresh
-                and cached.stream_url
-                and (time.time() - cached.stream_fetched_at) <= STREAM_URL_TTL_SECONDS
-            ):
-                return cached
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        log.info("Resolving stream for video_id=%s", video_id)
+        try:
+            with self._ydl() as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as e:
+            log.error("Failed to resolve stream for %s: %s", video_id, e)
+            return cached  # return whatever we had (maybe just metadata, no stream)
 
-            url = f"https://www.youtube.com/watch?v={video_id}"
-            log.info("Resolving stream for video_id=%s (force=%s)", video_id, force_refresh)
-            try:
-                with self._ydl() as ydl:
-                    info = ydl.extract_info(url, download=False)
-                with self._lock:
-                    self._last_resolve_error.pop(video_id, None)
-            except Exception as e:
-                message = str(e) or f"{type(e).__name__}"
-                with self._lock:
-                    self._last_resolve_error[video_id] = message[:1200]
-                log.error("Failed to resolve stream for %s: %s", video_id, message)
-                return cached
-
-            fresh = self._song_from_info(info)
-            if not fresh or fresh.id != video_id or not fresh.stream_url:
-                log.warning("yt-dlp returned no direct stream for %s", video_id)
-                return cached
-
-            # Preserve any nicer metadata already discovered by search/album
-            # resolution. The new media URL + headers always win.
-            if cached:
-                fresh.genre_hint = cached.genre_hint
-                if cached.album_id and not fresh.album_id:
-                    fresh.album_id = cached.album_id
-                    fresh.album_name = cached.album_name
-                    fresh.track_number = fresh.track_number or cached.track_number
-
-            self._cache_song(fresh)
-            self._persist_cache_async()
-            return fresh
-
-    def last_resolve_error(self, video_id: str) -> Optional[str]:
-        with self._lock:
-            return self._last_resolve_error.get(video_id)
-
-    def invalidate_stream(self, video_id: str) -> None:
-        with self._lock:
-            cached = self._song_cache.get(video_id)
-            if cached:
-                cached.stream_url = None
-                cached.stream_headers = {}
-                cached.stream_fetched_at = 0.0
+        fresh = self._song_from_info(info)
+        # Preserve any nicer cleaned title/artist we might already have cached
+        if cached:
+            fresh.genre_hint = cached.genre_hint
+            if cached.album_id and not fresh.album_id:
+                fresh.album_id = cached.album_id
+                fresh.album_name = cached.album_name
+                fresh.track_number = fresh.track_number or cached.track_number
+        self._cache_song(fresh)
+        self._persist_cache_async()
+        return fresh
 
     def get_song_metadata(self, video_id: str) -> Optional[Song]:
         with self._lock:
-            return self._song_cache.get(video_id)
+            hit = self._song_cache.get(video_id)
+        if hit:
+            return hit
+        # Not in this instance's memory yet -- check Redis before giving up
+        # (caller falls back to a full yt-dlp resolve only if this is None).
+        redis_hit = self._redis_get_song(video_id)
+        if redis_hit:
+            with self._lock:
+                self._song_cache[video_id] = redis_hit
+        return redis_hit
 
     def bulk_get(self, video_ids: list[str]) -> list[Song]:
+        found: list[Song] = []
+        missing: list[str] = []
         with self._lock:
-            return [self._song_cache[v] for v in video_ids if v in self._song_cache]
+            for v in video_ids:
+                if v in self._song_cache:
+                    found.append(self._song_cache[v])
+                else:
+                    missing.append(v)
+        for v in missing:
+            redis_hit = self._redis_get_song(v)
+            if redis_hit:
+                with self._lock:
+                    self._song_cache[v] = redis_hit
+                found.append(redis_hit)
+        # Preserve caller's requested order
+        by_id = {s.id: s for s in found}
+        return [by_id[v] for v in video_ids if v in by_id]
 
     # ------------------------------------------------------------ trending
     def trending(self, genre: Optional[str] = None, limit: int = 24) -> list[Song]:
@@ -847,6 +761,11 @@ class MusicEngine:
     def get_album_by_id(self, album_id: str, limit: int = 50) -> Optional[Album]:
         with self._lock:
             cached = self._album_cache.get(album_id)
+        if not cached:
+            cached = self._redis_get_album(album_id)
+            if cached:
+                with self._lock:
+                    self._album_cache[album_id] = cached
         fresh_enough = cached and (time.time() - cached.fetched_at) < ALBUM_TTL_SECONDS
         if fresh_enough and cached.track_ids:
             return cached
@@ -980,7 +899,7 @@ class MusicEngine:
         album.fetched_at = time.time()
         with self._lock:
             self._album_cache[album.id] = album
-        self._persist_album_cache_async()
+        self._persist_album_cache_async(album)
         self._persist_cache_async()
         return album
 
@@ -1048,7 +967,7 @@ class MusicEngine:
         )
         with self._lock:
             self._album_cache[album_id] = album
-        self._persist_album_cache_async()
+        self._persist_album_cache_async(album)
         return album
 
     # ---------------------------------------------------------------
